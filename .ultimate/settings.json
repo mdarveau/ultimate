@@ -1,4 +1,5 @@
 {
+  "port": 4749,
   "extensions": {
     "enable": ["voice-live"]
   },
