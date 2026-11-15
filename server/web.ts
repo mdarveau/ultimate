@@ -8,14 +8,17 @@ import { createReadStream } from 'node:fs'
 import { mkdir, readdir, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extname, join, relative, resolve, sep } from 'node:path'
+import { inExtensionTests } from '../shared/extension-api.ts'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { exec } from '../lib/exec.ts'
+import { ignoring, isMissing } from '../lib/errors.ts'
+import { debounce } from '../lib/timers.ts'
 import { writeTextAtomically } from '../lib/json-file.ts'
-import { discoverExtensions } from './discovery.ts'
-import { discoveryRoots } from './project.ts'
-import { projectSettings } from './project-setup.ts'
-import { extensionSettingsFiles } from './extension-settings.ts'
+import { discoverExtensions } from '../lib/discovery.ts'
+import { discoveryRoots } from '../lib/project-paths.ts'
+import { projectSettings } from '../lib/project-setup.ts'
+import { extensionSettingsFiles } from '../lib/extension-settings.ts'
 import type { Watch } from './extensions.ts'
 import { watchRoots } from './watch-roots.ts'
 import type { WebBuildRequest, WebBuildResult } from './web-build.ts'
@@ -64,7 +67,7 @@ export async function appIdentity(projectRoot: string, userHome: string) {
   if (typeof app?.icon === 'string') {
     const path = resolve(projectRoot, app.icon)
     // A missing icon leaves the stock icons.
-    const data = await readFile(path).catch(() => undefined)
+    const data = await readFile(path).catch(ignoring(isMissing))
     const size = data && pngSize(data)
     if (size) icon = { path, ...size }
   }
@@ -90,6 +93,8 @@ export async function createWeb(options: {
   userHome: string
   home: string
   watch: Watch
+  /** Settles once the checkout and its packages can be read: each build waits for it. */
+  before: () => Promise<unknown>
   /** Open browser pages: with none, a change only marks the bundle stale. */
   pages: () => number
   /** A new bundle is current, or a build started or ended. */
@@ -132,7 +137,7 @@ export async function createWeb(options: {
   let left: { file: string; error: string }[] = []
   let failed: string | undefined
   let pending = new Set<string>()
-  let timer: ReturnType<typeof setTimeout> | undefined
+  const scheduleUpdate = debounce(150, () => void update())
   const closing = new AbortController()
 
   async function fresh(current: Manifest) {
@@ -272,6 +277,7 @@ export async function createWeb(options: {
       try {
         await mkdir(folder, { recursive: true })
         while (stale && !closing.signal.aborted) {
+          await options.before()
           stale = false
           changedFiles = [...pending]
           pending = new Set()
@@ -298,12 +304,14 @@ export async function createWeb(options: {
   function touched(file: string) {
     pending.add(relative(ultimateRoot, file).startsWith('..') ? file : relative(ultimateRoot, file))
     stale = true
-    clearTimeout(timer)
-    if (options.pages() > 0) timer = setTimeout(() => void update(), 150)
+    scheduleUpdate.cancel()
+    if (options.pages() > 0) scheduleUpdate()
   }
   const inside = (file: string, root: string) => file === root || file.startsWith(root + sep)
+  const tests = (file: string) =>
+    roots.some((root) => inside(file, root) && inExtensionTests(relative(root, file)))
   const onChange = (file: string) => {
-    if (file.includes(`${sep}node_modules${sep}`)) return
+    if (file.includes(`${sep}node_modules${sep}`) || tests(file)) return
     if (inside(file, webRoot) || always.includes(file) || inputs.has(file)) return touched(file)
     if (roots.some((root) => inside(file, root)))
       void realpath(file).then(
@@ -313,7 +321,7 @@ export async function createWeb(options: {
       )
   }
   const onStructure = (file: string) => {
-    if (file.includes(`${sep}node_modules${sep}`)) return
+    if (file.includes(`${sep}node_modules${sep}`) || tests(file)) return
     if (inside(file, webRoot) || roots.some((root) => inside(file, root))) touched(file)
   }
   const structure = ['add', 'unlink', 'addDir', 'unlinkDir'] as const
@@ -463,7 +471,7 @@ export async function createWeb(options: {
         .pipe(response)
     },
     close() {
-      clearTimeout(timer)
+      scheduleUpdate.cancel()
       unwatch()
       // A build no one will be served: stop it rather than wait for it.
       closing.abort()

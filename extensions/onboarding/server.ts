@@ -1,3 +1,11 @@
+import type {
+  Conversation,
+  ConversationId,
+  Cursor,
+  EntryId,
+  Tx,
+  JsonObject,
+} from '@earendil-works/pi-durable'
 import { existsSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
 import { basename, join } from 'node:path'
@@ -7,17 +15,17 @@ import {
   defineEntry,
   defineExtension,
   defineTool,
+  LiveDoc,
   ROOT_CONVERSATION_ID,
 } from '@earendil-works/pi-durable'
 import { obj } from '@earendil-works/pi-schema'
 import { strEnum } from '../../lib/schema.ts'
+import { meansNone } from '../../lib/errors.ts'
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context'
-import type { Conversation, ConversationId } from '@earendil-works/pi-durable'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { isolatable } from '../../lib/git.ts'
 import { writeJson } from '../../lib/json-file.ts'
 import { readSettings, updateSettings, userSettingsPath } from '../../lib/settings.ts'
-import type { JsonObject } from '@earendil-works/pi-durable'
 import type { ExtensionAction } from '../../server/actions.ts'
 import { SubagentsApi } from '../subagents/api.ts'
 import { LineageApi } from '../lineage/api.ts'
@@ -39,8 +47,9 @@ import {
   StatusAction,
   WalkthroughAction,
 } from './refs.ts'
+import { safeToRerun } from '../../lib/replay.ts'
 
-export const Starts = defineDoc<{ roots: Record<string, number>; dismissed?: boolean }>({
+export const Starts = defineDoc<{ roots: Record<string, ConversationId>; dismissed?: boolean }>({
   kind: StartsDoc.kind,
   checkpointWhen: () => false,
   version: 1,
@@ -60,14 +69,14 @@ const ChoiceRequests = defineDoc<{ payloads: Record<string, JsonObject> }>({
 })
 export const docs = [Starts]
 export const StartEntry = defineEntry<{
-  root: number
+  root: ConversationId
   instructions?: string
   facts: {
     project: { name: string; path: string }
     firstRun: boolean
     projectUndecided: boolean
     gitReason?: string
-    root: number
+    root: ConversationId
     rootEmpty: boolean
   }
 }>('onboarding.start')
@@ -108,15 +117,11 @@ async function adds(projectRoot: string) {
       .filter((file) => file.endsWith('.md'))
       .toSorted()
       .map(async (file) => {
-        try {
-          const { name } = parseFrontmatter(
-            await readFile(join(directory, file), 'utf8'),
-          ).frontmatter
-          if (typeof name === 'string' && name.trim()) return name.trim()
-        } catch {
-          // An invalid definition still shows by its file name; the subagents extension reports the error.
-        }
-        return basename(file, '.md')
+        const definition = await readFile(join(directory, file), 'utf8')
+          .then((text) => parseFrontmatter(text))
+          .catch(meansNone)
+        const name = definition?.frontmatter.name
+        return typeof name === 'string' && name.trim() ? name.trim() : basename(file, '.md')
       }),
   )
   const skills = loadSkillsFromDir({
@@ -147,6 +152,31 @@ async function declared(path: string) {
 }
 
 const marker = (userHome: string) => join(userHome, '.ultimate/onboarding.json')
+
+/** Whether the conversation answered anything after entry `from`: a reply that is no error or abort. */
+async function answeredSince(tx: Tx, conversationId: ConversationId, from: EntryId) {
+  let cursor: Cursor | undefined
+  do {
+    const page = await tx.scanEntries(
+      { conversationId, minEntryId: from, order: 'ascending' },
+      100,
+      cursor,
+    )
+    if (
+      page.items.some((entry) => {
+        const message = entry.model?.[0]
+        return (
+          message?.role === 'assistant' &&
+          message.stopReason !== 'error' &&
+          message.stopReason !== 'aborted'
+        )
+      })
+    )
+      return true
+    cursor = page.next
+  } while (cursor)
+  return false
+}
 
 /** The walkthrough's model fact: @ultimate's model and context window, so beat 4 can recommend 1M+. */
 async function modelLine(host: ExtensionHost, conversation: Conversation) {
@@ -192,7 +222,7 @@ export const actions: Record<string, ExtensionAction> = {
     return { id }
   }),
   start: implementAction(StartAction, async (args, { host, conversationId }) => {
-    const input = args as { root?: number; instructions?: string } | null
+    const input = args as { root?: ConversationId; instructions?: string } | null
     if (
       input !== null &&
       (typeof input !== 'object' ||
@@ -205,12 +235,33 @@ export const actions: Record<string, ExtensionAction> = {
     const root =
       input?.root ??
       (conversationId === undefined ? undefined : await lineage.rootOf(conversationId, context)) ??
-      1
+      ROOT_CONVERSATION_ID
     const harness = host.harness()
+    const requestId = `onboarding:${root}`
     const existing = (await harness.snapshot(Starts, ROOT_CONVERSATION_ID, context))?.roots[
       String(root)
     ]
-    if (existing !== undefined) return { id: existing }
+    if (existing !== undefined) {
+      // A start whose run failed before answering (no model, an expired login, a provider error) never began. While
+      // @ultimate's newest run failed that way and nothing since the start was answered (inputs typed meanwhile may
+      // have failed too), continue it. Checked and admitted in one commit, so a second call finds it busy (#552022: a
+      // start without a model was a dead end).
+      const conversation = (await harness.conversation(existing, context))!
+      await harness.commit(async (tx) => {
+        const sent = await tx.submissionByRequest(conversation.id, requestId)
+        const { run, runFailure } = await tx.doc(LiveDoc, conversation.id)
+        if (
+          sent?.status !== 'unanswered' ||
+          sent.entry === undefined ||
+          run !== undefined ||
+          !['no_model', 'model_error'].includes(runFailure?.reason ?? '') ||
+          (await answeredSince(tx, conversation.id, sent.entry))
+        )
+          return
+        await conversation.submit(tx, { type: 'continue' })
+      }, context)
+      return { id: existing }
+    }
     if ((await lineage.rootOf(root, context)) !== root) throw new Error('Expected a project root')
     const id = await host.need(SubagentsApi).standing('ultimate', context)
     const project = await host.projectSetup()
@@ -222,8 +273,7 @@ export const actions: Record<string, ExtensionAction> = {
       ...('reason' in checkout ? { gitReason: checkout.reason } : {}),
       root,
       rootEmpty: await harness.commit(
-        async (tx) =>
-          !(await tx.scanEntries({ conversationId: root as ConversationId }, 1)).items.length,
+        async (tx) => !(await tx.scanEntries({ conversationId: root }, 1)).items.length,
         context,
       ),
     }
@@ -247,7 +297,7 @@ export const actions: Record<string, ExtensionAction> = {
           kind: StartEntry.kind,
           data: { root, ...(instructions === undefined ? {} : { instructions }), facts },
         },
-        requestId: `onboarding:${root}`,
+        requestId,
         whenBusy: 'followUp',
       },
       context,
@@ -324,7 +374,7 @@ export const actions: Record<string, ExtensionAction> = {
     const queue = host.resource('onboarding.choose', () => ({ tail: Promise.resolve() }))
     const operation = queue.tail.then(async () => {
       const harness = host.harness()
-      const id = conversationId as ConversationId
+      const id = conversationId
       const requestId = `onboarding-choice:${toolCallId}`
       const existing = await harness.commit((tx) => tx.submissionByRequest(id, requestId), context)
       if (existing) {
@@ -535,8 +585,9 @@ export default function onboarding(host: ExtensionHost) {
         parameters: obj({
           card: strEnum(['extensions', 'project', 'git']),
         }),
-        // Read-only inspection: repeating a card changes no state.
-        replay: 'safe',
+        ...safeToRerun(
+          'a rerun shows the same card again; reading the trust decision only creates its lock file',
+        ),
         async execute({ card }) {
           const project = await host.projectSetup()
           if (card === 'project' && (!project.config || project.decision !== null))

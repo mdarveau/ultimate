@@ -1,4 +1,5 @@
-import type { EntryRecord } from '@earendil-works/pi-durable'
+import { parseConversationId } from '../../lib/ids.ts'
+import type { EntryRecord, ConversationId } from '@earendil-works/pi-durable'
 import { isOpen, isOwed, openQuestion } from '../../lib/message-state.ts'
 import type { MessagesData, Message, Remote } from './refs.ts'
 
@@ -9,7 +10,7 @@ export const remoteLabel = (remote: Pick<Remote, 'project' | 'machine'>) =>
   `@ultimate@${remote.project} on ${remote.machine}`
 
 /** Only incoming requests belong to an answer, never the outgoing reply log item. */
-export function answeredMessages(messages: Message[], conversation: number, entry: number) {
+export function answeredMessages(messages: Message[], conversation: ConversationId, entry: number) {
   return messages.filter((message) => message.to === conversation && message.answer === entry)
 }
 
@@ -18,11 +19,12 @@ export const emptyMessages: MessagesData = { messages: [], next: 1 }
 export const waitingOnUser = (log: MessagesData) => log.messages.filter(openQuestion).length
 
 /**
- * Where a conversation stands, the one state every view shows:
+ * Where a conversation stands, the one state every view shows, first match wins:
  * - `paused`: the host is paused and its run is parked: no task of it executes until Play;
+ * - `waits`: a question waits on the user, even while the conversation or a subagent of it works, since the question
+ *   asks the user to act: for the primary agent (@ultimate) any question open with the user, for any other
+ *   non-subagent conversation one of its own; views that can keep showing the work (a pulsing mark) do;
  * - `working`: it runs, or has input queued;
- * - `waits`: the primary agent (@ultimate) counts every question open with the user; a non-subagent
- *   conversation has one of its own open. This is the state that asks the user to act;
  * - `awaiting`: a conversation that is no subagent asked the primary agent (a branch asking @ultimate) and waits for
  *   the answer, or reported to it and has not heard from it since; a subagent's questions go to its parent, which
  *   answers them in its own run;
@@ -57,16 +59,13 @@ export function conversationState(
 ): ConversationState {
   const { id, kind, runState } = conversation
   if (conversation.parked) return 'paused'
-  if (conversation.busy || runState === 'working' || runState === 'queued') return 'working'
   if (
     kind === 'primary'
       ? waitingOnUser(log) > 0
-      : kind !== 'subagent' &&
-        log.messages.some(
-          (m) => m.from === id && m.to === 'user' && m.reply && m.state === 'delivered',
-        )
+      : kind === 'other' && log.messages.some((m) => m.from === id && openQuestion(m))
   )
     return 'waits'
+  if (conversation.busy || runState === 'working' || runState === 'queued') return 'working'
   if (
     kind !== 'subagent' &&
     awaitsPrimary(id, conversation.primary, log, () => conversation.concludedSince)
@@ -82,7 +81,7 @@ function awaitsPrimary(
   id: number,
   primary: number | undefined,
   log: MessagesData,
-  concludedSince: (id: number) => number | undefined,
+  concludedSince: (id: ConversationId) => number | undefined,
 ) {
   if (primary === undefined) return false
   return (
@@ -100,7 +99,7 @@ export function pendingReport(
   messages: readonly Message[],
   from: number | 'user' | 'remote',
   to: number | 'user' | 'remote',
-  concludedSince: (id: number) => number | undefined,
+  concludedSince: (id: ConversationId) => number | undefined,
 ) {
   let pending: Message | undefined
   for (const m of messages)
@@ -248,8 +247,8 @@ export function landedSha(entry: EntryRecord): string | undefined {
   return typeof sha === 'string' ? sha.slice(0, 7) : undefined
 }
 
-const idOf = (value: unknown): (number | 'remote')[] =>
-  typeof value === 'number' || value === 'remote' ? [value] : []
+const idOf = (value: unknown): (ConversationId | 'remote')[] =>
+  typeof value === 'number' ? [parseConversationId(value)] : value === 'remote' ? [value] : []
 
 /**
  * Whether an entry says work landed: the lander's landing note, or its report of a landing. Landings are news you wait
@@ -268,7 +267,7 @@ export function counterparts(
     calls,
   }: { entry: EntryRecord; calls: readonly { id: string; name: string; arguments: unknown }[] },
   log: Readonly<MessagesData>,
-): (number | 'remote' | 'lander')[] {
+): (ConversationId | 'remote' | 'lander')[] {
   const data = (entry.data ?? {}) as {
     from?: unknown
     sender?: unknown
@@ -295,7 +294,7 @@ export function counterparts(
       const sent = log.messages.find((m) => m.call === call.id)
       if (sent) return idOf(sent.to)
       const to = /^#(\d+)$/.exec(String((call.arguments as { to?: unknown } | undefined)?.to))
-      return to ? [Number(to[1])] : []
+      return to ? [parseConversationId(Number(to[1]))] : []
     })
   return [
     ...answeredMessages(log.messages, entry.conversationId, entry.id).flatMap((m) => idOf(m.from)),
@@ -315,7 +314,7 @@ export const answerTo = (messages: readonly Message[], question: Message) =>
 export function openMessages(
   messages: readonly Message[],
   id: number,
-  concludedSince: (id: number) => number | undefined,
+  concludedSince: (id: ConversationId) => number | undefined,
 ) {
   const reporters = new Set(
     messages.filter((m) => m.to === id && (m.report || m.awaits)).map((m) => m.from),
@@ -333,8 +332,10 @@ export function openMessages(
 }
 
 /** Whether a report is settled: its sender was concluded after sending it (or is concluded now). */
-export const settled = (message: Message, concludedSince: (id: number) => number | undefined) =>
-  typeof message.from === 'number' && message.at <= (concludedSince(message.from) ?? -Infinity)
+export const settled = (
+  message: Message,
+  concludedSince: (id: ConversationId) => number | undefined,
+) => typeof message.from === 'number' && message.at <= (concludedSince(message.from) ?? -Infinity)
 
 /** Who waits on whom for one message; `yours` is an open question to the user. */
 export function messageStatus(message: Message) {
@@ -364,4 +365,23 @@ export function outgoingState(message: Message | undefined, toUser: boolean, run
   if (message.state === 'sent') return 'sending'
   if (!message.reply) return 'delivered'
   return toUser ? 'awaiting your reply' : 'awaiting reply'
+}
+
+/** Where an open question's card is, against the transcript's view. */
+export type Place = 'above' | 'visible' | 'below'
+
+/** A direction's pointer: how many questions wait that way, and the nearest one, which a click goes to. */
+export type Pointer<T> = { count: number; nearest: T }
+
+/**
+ * The pointers to open questions out of view, from each question's place in transcript order (oldest first): one up
+ * when any is above, aiming at the lowest of them, and one down when any is below, aiming at the highest.
+ */
+export function offscreen<T>(questions: readonly { key: T; place: Place }[]) {
+  const above = questions.filter((q) => q.place === 'above')
+  const below = questions.filter((q) => q.place === 'below')
+  return {
+    up: above.length ? { count: above.length, nearest: above.at(-1)!.key } : undefined,
+    down: below.length ? { count: below.length, nearest: below[0].key } : undefined,
+  } satisfies Record<'up' | 'down', Pointer<T> | undefined>
 }

@@ -13,11 +13,14 @@ its definition's `icon` and `tint` for any other resident, else a bot — with a
 waits on you). Then its display name (its definition's `title`, else the ULTIMATE wordmark for @ultimate, `Lander`, or
 the name capitalised) with `@name` small and muted. The same mark sits in the title bar's button and before standing senders in chat bubbles.
 
-The **project** heads the sidebar: its path from home (or `<project> #<worktree>`, the full path on hover) with a quiet
-`History #id` on the right, and its root's **Memory** row under it, as one block. Clicking the path opens the root's
-History, the project's read-only tally. A chevron before the path folds the block to that one row (folded by default,
-kept in `ext.conversations.projectOpen`); folded, a quiet brain and memory count on the right of the path row opens
-Memory instead.
+The **project** heads the sidebar (`project.tsx`): a slim bar of its colour (`ProjectSwatch`, `tile.tsx`, the same
+the project rail draws), its display name (the folder prettified by `prettyName`:
+`omarchy-config` → `Omarchy Config`) and under it its path from home, small and muted (`#<worktree>` in a branch
+checkout, `preview · …` on a preview; the full path on hover). Under them, when `origin` is on GitHub, its
+`owner/repo` with GitHub's mark links to the repository, with a lock and `private` (or `public`) when `gh` could say
+(workspaces' `repo`). Clicking the name opens the root's History, the project's read-only tally. A chevron on the
+right folds the root's **Memory** row under it (folded by default, kept in `ext.conversations.projectOpen`); folded,
+a quiet brain and memory count beside the chevron opens Memory instead.
 
 The sidebar also stands beside lineage's Memory surface, so rows open conversations through `useShell` (`state.tsx`),
 which brings the Agent surface back; beside Memory no conversation row is highlighted, the Memory row (or the folded
@@ -34,7 +37,8 @@ and the age of its latest landing (what landed is its Landed section's first row
 compacts the context; they are never renamed, cleared or concluded.
 
 Beyond a phone the title bar's ULTIMATE wordmark (`titlebar.brand`) opens @ultimate too.
-@ultimate's mark is amber while questions wait on you, and its line says how many; the To-dos tab lists them. On
+@ultimate's mark and line (`waits on you`) are amber while questions wait on you; the Inbox row under it says how many
+and lists them (`extensions/inbox`). On
 phones, where the sidebar is hidden, the title bar's `@ultimate` button (`titlebar.left`) opens @ultimate from every
 surface instead, with the same mark: its dot pulses while @ultimate works and is amber while questions wait.
 
@@ -42,7 +46,8 @@ Every section of the sidebar folds the same way (`Section`, `section.tsx`): a qu
 a count bubble, open by default, its fold state kept per section in `ext.conversations.closedSections`; the Scheduled
 section of the `sidebar.top` slot draws the same heading. Top to bottom:
 
-- **Project**: the chevron, the path, opening History, and the Memory row (or, folded, its brain count).
+- **Project**: its colour bar, name, path and repository, opening History; the chevron and the Memory row (or, folded, its
+  brain count).
 - **@ultimate**, then the **Agents** group: the lander first, with its **Landed · N** section right under its row,
   aligned with the other sections, then other standing agents.
 - **Landed**: the latest landings of every root (lineage's `recent {id, types: ['landed'], limit: 20}`), newest
@@ -105,7 +110,7 @@ A row switches to its child, highlights selection and keeps the top-level summar
 invented delegation edges. Expansion is persisted in `ext.conversations.expanded`; buttons support keyboard access.
 
 @ultimate starts coordinator branches; there are no manual creation commands or isolation preferences. The sidebar
-header names the project's path (`<project> #<worktree>` in a branch checkout), the full path on hover; Info's first
+header names the project and its path (`#<worktree>` in a branch checkout), the full path on hover; Info's first
 section lists the checkouts.
 Conclude releases clean, fully landed checkouts, including owned subagent checkouts. Uncommitted files,
 unlanded commits, and busy checkouts are kept.

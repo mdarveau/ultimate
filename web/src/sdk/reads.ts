@@ -1,4 +1,7 @@
+import type { ConversationId } from '@earendil-works/pi-durable'
 import { actionRef } from '../../../shared/extension-api.ts'
+import { retryAfter } from '../../../lib/timers.ts'
+import type { Cancel } from '../../../lib/timers.ts'
 import { actionMessage } from './api.ts'
 import type { ActionArgs, ActionError, ActionOptions, Api } from './api.ts'
 import type { Store } from './store.ts'
@@ -44,21 +47,35 @@ const FRESH = 2000
  */
 export function createReads(api: Api, store: Store) {
   const reads = new Map<string, Read & { readers: Set<Reader> }>()
+  /** Reads whose last call never reached the server (status 0), asked again once the page is back. */
+  const missed = new Set<Read & { readers: Set<Reader> }>()
+  function retryMissed() {
+    for (const read of missed) if (read.readers.size) void read.refetch()
+  }
   let process: string | undefined
+  let connection = store.getState().connection.status
   store.subscribe(() => {
+    const status = store.getState().connection.status
+    if (status !== connection) {
+      connection = status
+      if (status === 'open') retryMissed()
+    }
     const system = store.getState().system
     const next = system && `${system.process.pid}:${system.process.generation}`
     if (next === process) return
     const restarted = process !== undefined
     process = next
-    // oxlint-disable-next-line typescript/no-floating-promises -- a read reports failures and resolves undefined rather than rejecting.
     if (restarted) for (const read of reads.values()) if (read.readers.size) void read.refetch()
   })
   if (typeof window !== 'undefined')
     window.addEventListener('focus', () => {
       for (const read of reads.values())
-        // oxlint-disable-next-line typescript/no-floating-promises -- a read reports failures and resolves undefined rather than rejecting.
         if ([...read.readers].some((reader) => reader.focus)) void read.refetch()
+    })
+  if (typeof window !== 'undefined') window.addEventListener('online', retryMissed)
+  if (typeof document !== 'undefined')
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') retryMissed()
     })
 
   /** Forget the oldest reads nobody reads beyond `IDLE`, disabled ones included. */
@@ -72,27 +89,27 @@ export function createReads(api: Api, store: Store) {
     extension: string,
     name: string,
     args: unknown,
-    conversationId?: number,
+    conversationId?: ConversationId,
   ) {
     let state: ReadState = { loading: false, settled: false }
     const listeners = new Set<() => void>()
     const readers = new Set<Reader>()
     let controller: AbortController | undefined
     let queued: Promise<unknown> | undefined
-    let poll: ReturnType<typeof setTimeout> | undefined
+    let cancelPoll: Cancel | undefined
     let answered = 0
     const set = (change: Partial<ReadState>) => {
       state = { ...state, ...change }
       for (const listener of listeners) listener()
     }
     function repoll() {
-      clearTimeout(poll)
+      cancelPoll?.()
       const every = Math.min(...[...readers].map((reader) => reader.every ?? Infinity))
-      if (every !== Infinity && !controller) poll = setTimeout(() => void run(), every)
+      if (every !== Infinity && !controller) cancelPoll = retryAfter(every, () => void run())
     }
     async function run() {
       controller?.abort()
-      clearTimeout(poll)
+      cancelPoll?.()
       const own = new AbortController()
       controller = own
       // The readers' reporting as the call starts: one that leaves meanwhile still keeps its failure quiet.
@@ -105,11 +122,21 @@ export function createReads(api: Api, store: Store) {
         )
         if (own.signal.aborted) return undefined
         answered = Date.now()
+        missed.delete(read)
         set({ data, error: undefined, loading: false, settled: true })
         return data
       } catch (error) {
         if (own.signal.aborted) return undefined
         const failure = error as ActionError
+        // The request never reached the server: a sleeping tab, the network gone, or the server down (which the
+        // status line shows as reconnecting). Nobody asked for this read by hand, so keep the last answer and ask again
+        // when the page is back instead of reporting it (#555684).
+        if (failure.status === 0) {
+          missed.add(read)
+          set({ loading: false })
+          return undefined
+        }
+        missed.delete(read)
         set({ error: failure, loading: false, settled: true })
         // One report per failed call: the first reader's handler, else a notice.
         if (onError) onError(failure)
@@ -138,14 +165,14 @@ export function createReads(api: Api, store: Store) {
         readers.add(reader)
         // A reader joining a call in flight, or an answer just given, takes that one: components of one page mount over
         // several commits, and each asking again aborted the call before it.
-        // oxlint-disable-next-line typescript/no-floating-promises -- a read reports failures and resolves undefined rather than rejecting.
         if (!controller && !queued && Date.now() - answered > FRESH) void read.refetch()
         else repoll()
         return () => {
           readers.delete(reader)
           if (readers.size) return repoll()
           // A call in flight finishes: a component remounting at once, as the shell does while its facets load, takes it.
-          clearTimeout(poll)
+          cancelPoll?.()
+          missed.delete(read)
           evict()
         }
       },
@@ -164,7 +191,7 @@ export function createReads(api: Api, store: Store) {
 
   return {
     /** The read of `extension/name` with `args` on `conversationId` (the shown conversation when absent). */
-    get(extension: string, name: string, args: unknown, conversationId?: number): Read {
+    get(extension: string, name: string, args: unknown, conversationId?: ConversationId): Read {
       const key = JSON.stringify([extension, name, args ?? null, conversationId ?? null])
       let read = reads.get(key)
       if (!read) {

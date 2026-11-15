@@ -1,4 +1,4 @@
-// Pi upstream: @earendil-works/pi-durable@1.5.0 src/tools/edit.ts and src/tools/edit-diff.ts — internal untyped details.patch/details.diff formats drive the diff renderer. Drop when Pi exports structured diff rows for rendering.
+// Pi upstream: @earendil-works/pi-durable@1.5.2 src/tools/edit.ts and src/tools/edit-diff.ts — internal untyped details.patch/details.diff formats drive the diff renderer. Drop when Pi exports structured diff rows for rendering.
 import type { Ref } from 'react'
 import { cn } from '@/sdk'
 
@@ -103,12 +103,10 @@ export function Diff({
       <div className="grid min-w-max grid-cols-[auto_auto_auto_1fr]">
         {rows.map((row, index) =>
           row.type === 'hunk' || row.type === 'gap' ? (
-            // oxlint-disable-next-line react/no-array-index-key -- Positional diff rows, including repeated gaps.
             <div className={cn('col-span-4 px-3', tone[row.type])} key={index}>
               {row.type === 'gap' ? '⋯' : row.text}
             </div>
           ) : (
-            // oxlint-disable-next-line react/no-array-index-key -- Positional diff lines while the patch streams.
             <div className={cn('col-span-4 grid grid-cols-subgrid', tone[row.type])} key={index}>
               <span className="pl-3 text-right text-muted-foreground/50 select-none">
                 {numbered ? (row.old ?? '') : ''}

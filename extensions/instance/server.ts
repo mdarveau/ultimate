@@ -1,3 +1,4 @@
+import type { ConversationId, ToolExecutionApi, JsonObject } from '@earendil-works/pi-durable'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   cp,
@@ -16,11 +17,9 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, join, resolve as resolvePath } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { setTimeout as sleep } from 'node:timers/promises'
-import type { Context } from '@earendil-works/chord'
-import { int, obj, opt, str } from '@earendil-works/pi-schema'
+import type { Context } from '@earendil-works/chord/context'
+import { int, nullable, obj, opt, str } from '@earendil-works/pi-schema'
 import { strEnum } from '../../lib/schema.ts'
-import type { ConversationId, ToolExecutionApi } from '@earendil-works/pi-durable'
 import { defineExtension, defineTool, section } from '@earendil-works/pi-durable'
 import type { ExtensionAction } from '../../server/actions.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
@@ -31,11 +30,12 @@ import type { WorkspaceService } from '../workspaces/api.ts'
 import { cleanPreview, sweepPreviews } from './cleanup.ts'
 import { implementAction } from '../../lib/actions.ts'
 import { git, isolatable } from '../../lib/git.ts'
+import { meansNone, overshadowed } from '../../lib/errors.ts'
 import { spawnGroup, stopGroup } from '../../lib/process-group.ts'
+import { within } from '../../lib/timers.ts'
 import type { Group, GroupProcess } from '../../lib/process-group.ts'
 import { Previews } from '../conversations/api.ts'
 import { ListAction } from './refs.ts'
-import type { JsonObject } from '@earendil-works/pi-durable'
 import { readSettings, userSettingsPath } from '../../lib/settings.ts'
 import { readFamilies } from '../../lib/families-settings.ts'
 import { BUILTIN_FAMILIES, DEFAULT_FAMILY, FEATURES } from '../../lib/families.ts'
@@ -231,10 +231,12 @@ interface Instance {
   pid: number
   temporary: boolean
   /** The conversation whose workspace it previews, or which started it in the shared checkout. */
-  conversationId?: number
+  conversationId?: ConversationId
   child: GroupProcess
   group: Group
   output: string
+  /** A stop under way, so a start of the same home waits for it instead of finding the home still owned. */
+  stopping?: Promise<void>
 }
 
 const info = ({ id, url, home, pid, conversationId }: Instance) => ({
@@ -265,7 +267,7 @@ const listed = ({
 }: {
   id: string
   url: string
-  conversationId: number
+  conversationId: ConversationId
 }) => ({
   id,
   url,
@@ -283,8 +285,8 @@ export const stopped = (host: Pick<ExtensionHost, 'resource' | 'home'>) =>
     try {
       const saved = JSON.parse(readFileSync(join(host.home, 'previews.json'), 'utf8')) as Listed[]
       for (const item of saved) byPort.set(portOf(item.url), item)
-    } catch {
-      // No previews stopped in this home yet, or an unreadable file: links to earlier ones stay ordinary links.
+    } catch (error) {
+      meansNone(error)
     }
     return byPort
   })
@@ -299,9 +301,17 @@ export function remember(
   for (const port of [...byPort.keys()].slice(0, -50)) byPort.delete(port)
   writeFileSync(join(host.home, 'previews.json'), JSON.stringify([...byPort.values()]))
 }
-async function stop(instances: Map<string, Instance>, id: string) {
+function stop(instances: Map<string, Instance>, id: string) {
   const instance = instances.get(id)
-  if (!instance) throw new Error(`Unknown instance: ${id}`)
+  if (!instance) return Promise.reject(new Error(`Unknown instance: ${id}`))
+  // A failed stop can be tried again.
+  instance.stopping ??= stopInstance(instances, instance).catch((error: unknown) => {
+    instance.stopping = undefined
+    throw error
+  })
+  return instance.stopping
+}
+async function stopInstance(instances: Map<string, Instance>, instance: Instance) {
   // The whole group: the preview and whatever it started without a group of its own. Its unreaped leader proves the
   // group is still ours; once it exited, the group stopped with it.
   if (instance.child.pid !== undefined)
@@ -312,7 +322,7 @@ async function stop(instances: Map<string, Instance>, id: string) {
     })
     await cleanPreview(instance.home)
   }
-  instances.delete(id)
+  instances.delete(instance.id)
 }
 
 /**
@@ -429,9 +439,9 @@ export default function instanceExtension(
     })
   })
   async function start(
-    args: { home?: string },
+    args: { home?: string; model?: string | null },
     context: Context,
-    prepare: () => Promise<{ cwd: string; project: string; conversationId?: number }>,
+    prepare: () => Promise<{ cwd: string; project: string; conversationId?: ConversationId }>,
     output: (text: string) => void = () => {},
   ) {
     let reserved = false
@@ -463,6 +473,10 @@ export default function instanceExtension(
       }
       if (home === (await realpath(host.home)))
         throw new Error('A test instance cannot share the running server home')
+      // A stop and a start of the same home in one tool round run side by side (omarchy-config #78009); wait for the
+      // stop.
+      for (const item of instances.values())
+        if (item.home === home) await item.stopping?.catch(overshadowed)
       if ([...instances.values()].some((item) => item.home === home && live(item)))
         throw new Error('Home is already owned by an instance')
       context.abortSignal?.throwIfAborted()
@@ -477,7 +491,9 @@ export default function instanceExtension(
         project,
         userHome,
         ownerPid: process.pid,
-        model: await previewModelSetting(host),
+        // An explicit model, or null for none, wins over the setting for this start only.
+        model:
+          args.model === undefined ? await previewModelSetting(host) : (args.model ?? undefined),
         git: await previewGit(project, home),
       })
       // No pid file: a preview exits by itself once its owner is gone (ULTIMATE_INSTANCE_OWNER).
@@ -510,49 +526,36 @@ export default function instanceExtension(
           .join('\n')
           .slice(-100000)
       }
-      let stdout = ''
-      child.stdout?.on('data', (chunk: Buffer) => {
-        append(chunk)
-        stdout += chunk.toString()
-        const lines = stdout.split('\n')
-        stdout = lines.pop()!.slice(-10000)
-        for (const line of lines) {
-          const match = /^Ultimate: (http:\/\/127\.0\.0\.1:([1-9]\d*))\r?$/.exec(line)
-          if (match) item.url = match[1]
-        }
+      const notReady = () => new Error(`Instance did not become ready:\n${item.output}`)
+      const serving = new Promise<void>((resolve, reject) => {
+        let stdout = ''
+        child.stdout?.on('data', (chunk: Buffer) => {
+          append(chunk)
+          stdout += chunk.toString()
+          const lines = stdout.split('\n')
+          stdout = lines.pop()!.slice(-10000)
+          for (const line of lines) {
+            const match = /^Ultimate: (http:\/\/127\.0\.0\.1:([1-9]\d*))\r?$/.exec(line)
+            if (match) {
+              item.url = match[1]
+              resolve()
+            }
+          }
+        })
+        child.on('error', (error) => {
+          item.output += String(error)
+          reject(notReady())
+        })
+        child.on('exit', () => reject(notReady()))
+        const signal = context.abortSignal
+        if (signal?.aborted) reject(signal.reason)
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
       })
       child.stderr?.on('data', append)
-      let failed = false
-      child.on('error', (error) => {
-        failed = true
-        item.output += String(error)
-      })
       try {
         output(`Starting ${id}\n`)
-        const deadline = Date.now() + 60000
-        let ready = false
-        while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
-          context.abortSignal?.throwIfAborted()
-          if (failed) break
-          try {
-            const response = item.url
-              ? await fetch(`${item.url}/api/models`, {
-                  signal: context.abortSignal
-                    ? AbortSignal.any([context.abortSignal, AbortSignal.timeout(1000)])
-                    : AbortSignal.timeout(1000),
-                })
-              : undefined
-            if (response?.ok && !failed && child.exitCode === null && child.signalCode === null) {
-              ready = true
-              break
-            }
-          } catch {
-            /* server is still booting */
-          }
-          await sleep(250, undefined, { signal: context.abortSignal })
-        }
+        await within(60000, serving, notReady, context.abortSignal)
         context.abortSignal?.throwIfAborted()
-        if (!ready) throw new Error(`Instance did not become ready:\n${item.output}`)
         return info(item)
       } catch (error) {
         await stop(instances, id)
@@ -601,10 +604,7 @@ export default function instanceExtension(
           ['server/main.ts', false, 'Worktree is not Ultimate: missing server/main.ts'],
           ['node_modules', true, 'Worktree has no node_modules; run pnpm install first'],
         ] as const) {
-          const entry = await stat(join(cwd, path)).catch(
-            // An unreadable prerequisite fails the explicit preview validation below.
-            () => undefined,
-          )
+          const entry = await stat(join(cwd, path)).catch(meansNone)
           if (!entry || (directory ? !entry.isDirectory() : !entry.isFile()))
             throw new Error(message)
         }
@@ -645,12 +645,13 @@ export default function instanceExtension(
       defineTool({
         name: 'instance',
         description:
-          'Start, inspect logs, list or stop isolated standalone Ultimate test servers (maximum three). Defaults to the calling workspace; set subagent to preview an owned child worktree.',
+          'Start, inspect logs, list or stop isolated standalone Ultimate test servers (maximum three). Defaults to the calling workspace; set subagent to preview an owned child worktree. model on start pins every agent to one provider/id, or null runs each on its own configured model; omitted, the instance.model setting applies.',
         parameters: obj({
           action: strEnum(['start', 'stop', 'logs', 'list']),
           id: opt(str()),
           home: opt(str()),
           subagent: opt(int({ minimum: 1 })),
+          model: opt(nullable(str({ pattern: '^[^/\\s]+/\\S+$' }))),
         }),
         async execute(args, api, context) {
           try {

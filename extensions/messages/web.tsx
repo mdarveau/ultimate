@@ -1,4 +1,6 @@
-import type { EntryRecord } from '@earendil-works/pi-durable'
+import { parseConversationId } from '../../lib/ids.ts'
+import type { EntryRecord, ConversationId } from '@earendil-works/pi-durable'
+import { ROOT } from '@/sdk'
 import { useEffect, useState } from 'react'
 import {
   api,
@@ -32,12 +34,13 @@ import {
 import { callerOf } from './caller.ts'
 import { OpenMessages } from './open.tsx'
 import { QuestionPointer } from './pointer.tsx'
+import { OffscreenQuestions } from './waiting.tsx'
 import { StandingDoc } from '../subagents/ui.tsx'
 import { MessagesDoc, CallerAction } from './refs.ts'
 import type { MessagesData } from './refs.ts'
 
 function MessageAnswerLabel({ entry }: { entry: EntryRecord }) {
-  const log = useDocOf(1, MessagesDoc) ?? emptyMessages
+  const log = useDocOf(ROOT, MessagesDoc) ?? emptyMessages
   const conversation = useConversation((value) => value.id)
   const messages =
     conversation === undefined ? [] : answeredMessages(log.messages, conversation, entry.id)
@@ -63,9 +66,9 @@ function MessageNavigation() {
   const { surface, showSurface } = useUltimate()
   // A cold load mounts the overlays first: the transcript that reveals comes with the page.
   const { ready } = useReady()
-  const log = useDocOf(1, MessagesDoc)
+  const log = useDocOf(ROOT, MessagesDoc)
   const [target, setTarget] = useState<{
-    conversation: number
+    conversation: ConversationId
     entry?: number
     call?: string
     message?: number
@@ -75,7 +78,7 @@ function MessageNavigation() {
   useEffect(() => {
     const url = new URL(location.href)
     const message = Number(url.searchParams.get('message'))
-    const conversation = Number(url.searchParams.get('conversation'))
+    const conversation = parseConversationId(Number(url.searchParams.get('conversation')))
     if (!url.searchParams.has('message')) return
     url.searchParams.delete('message')
     history.replaceState(history.state, '', url)
@@ -128,7 +131,12 @@ function MessageNavigation() {
 }
 
 export default defineWebExtension({
-  slots: { overlay: [MessageNavigation], 'composer.status': [OpenMessages] },
+  slots: {
+    overlay: [MessageNavigation],
+    'composer.status': [OpenMessages],
+    // Under the pinned prompt, which comes first, so a mark never covers it.
+    'transcript.top': [{ component: OffscreenQuestions, order: 1 }],
+  },
   entries: {
     'board.message': MessageInput,
     'board.reply': MessageInput,
@@ -136,7 +144,7 @@ export default defineWebExtension({
     'board.answered': () => null,
     // Retired: triage's wake-up pointer in older transcripts.
     'board.wake': () => null,
-    // The agent's reminder of the questions still open; the user sees them in the To-dos panel.
+    // The agent's reminder of the questions still open; the user sees them in the Inbox.
     'board.open': () => null,
     'pi.assistant': CompactAnswer,
   },

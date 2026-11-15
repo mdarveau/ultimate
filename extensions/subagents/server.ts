@@ -1,10 +1,21 @@
+import { parseConversationId } from '../../lib/ids.ts'
+import type {
+  ConversationId,
+  ConversationRecord,
+  Cursor,
+  EntryId,
+  EntryRecord,
+  TaskId,
+  ToolExecutionApi,
+  SubmissionRecord,
+} from '@earendil-works/pi-durable'
 import { existsSync } from 'node:fs'
 import { onCommit } from '../../lib/commits.ts'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKGROUND_CONTEXT, withCancel } from '@earendil-works/chord/context'
-import type { Context } from '@earendil-works/chord'
-import type { JsonValue } from '@earendil-works/chord'
+import type { Context } from '@earendil-works/chord/context'
+import type { JsonValue } from '@earendil-works/chord/json'
 import { arr, bool, int, obj, opt, str } from '@earendil-works/pi-schema'
 import { strEnum } from '../../lib/schema.ts'
 import type { AssistantMessage, ModelThinkingLevel } from '@earendil-works/pi-ai'
@@ -23,31 +34,20 @@ import {
   ROOT_CONVERSATION_ID,
   section,
 } from '@earendil-works/pi-durable'
-import type {
-  ConversationId,
-  ConversationRecord,
-  Cursor,
-  EntryId,
-  EntryRecord,
-  TaskId,
-  ToolExecutionApi,
-  SubmissionRecord,
-} from '@earendil-works/pi-durable'
 import type { ExtensionHost } from '../../server/extensions.ts'
-import type { Source } from '../../server/project.ts'
+import type { Source } from '../../lib/project-paths.ts'
 import {
   agentRoots,
-  definitionAgent,
   deleteDefinition,
   discoverAgents,
   hasLogin,
-  hostDefaultModel,
+  hostDefault,
   previewModel,
   saveDefinition,
   saveOverlay,
 } from '../../lib/agents.ts'
 import type { AgentDefinition, DefinitionFields } from '../../lib/agents.ts'
-import { createChild, started } from './children.ts'
+import { createChild, reconfigure, started } from './children.ts'
 import { implementAction } from '../../lib/actions.ts'
 import { exec } from '../../lib/exec.ts'
 import { shortTitle } from '../../lib/title.ts'
@@ -56,6 +56,7 @@ import { ConversationsApi, Marks } from '../conversations/api.ts'
 import type { AgentMarkStyle } from '../conversations/refs.ts'
 import { Pin } from '../models/api.ts'
 import { Profile, Runs, Standing, Subagents, SubagentsApi } from './api.ts'
+import type { SubagentsService } from './api.ts'
 import { definitionRuns, refName, refOf } from '../../lib/families.ts'
 import { readFamilies } from '../../lib/families-settings.ts'
 import {
@@ -65,6 +66,7 @@ import {
   SaveDefinitionAction,
   StandingAction,
 } from './refs.ts'
+import { safeToRerun } from '../../lib/replay.ts'
 
 export const docs = [Subagents, Standing, Profile, Runs]
 
@@ -631,60 +633,62 @@ export default function subagents(
       return definition?.runs ? definition.runs.model : definition?.model
     },
   })
-  host.implement(SubagentsApi, {
+  const service: SubagentsService = {
     async createChild(tx, options) {
       const child = await createChild(host, tx, options)
       await started(host, tx, child, options.definition?.name ?? options.label, 'child')
       return child
     },
+    async reconfigure(tx, id, { definition, parentAgent, modelRuntime }) {
+      await reconfigure(tx, id, definition, parentAgent, modelRuntime)
+    },
     async residents(_ctx) {
       return (await residentDefinitions()).map(({ name, description }) => ({ name, description }))
     },
     async standing(name, ctx) {
-      const definitions = await residentDefinitions()
-      const definition = definitions.find((item) => item.name === name)
-      if (!definition) {
-        await pruneRetired(ctx)
-        throw new Error(
-          `Unknown standing agent @${name}. Standing agents: ${definitions.map((item) => `@${item.name}`).join(', ') || 'none'}`,
-        )
-      }
       const root = (await host.harness().conversation(ROOT_CONVERSATION_ID, ctx))!
       const main = await root.agent(ctx)
-      return host.harness().commit(async (tx) => {
-        const index = await tx.doc(Standing, ROOT_CONVERSATION_ID)
-        let id = Object.hasOwn(index, name) ? index[name] : undefined
-        let created: ConversationRecord | undefined
-        // A new conversation starts on the default model; an existing one keeps the model and thinking level chosen
-        // in it, so a refresh changes them only where the definition pins them.
-        let base = { ...main, model: await hostDefaultModel(host) }
-        if (id !== undefined && (await tx.conversation(id))) {
-          const own = await tx.doc(AgentDoc, id)
-          base = {
-            ...main,
-            model: own.model ?? base.model,
-            thinkingLevel: own.thinkingLevel ?? main.thinkingLevel,
+      const result = await host
+        .harness()
+        .commit(async (tx): Promise<{ id: ConversationId } | { missing: string[] }> => {
+          // Read inside the commit: commits run one at a time, so a read made before it could put back instructions that
+          // a turn applying an edited or removed overlay had just replaced.
+          const definitions = await residentDefinitions()
+          const definition = definitions.find((item) => item.name === name)
+          if (!definition) return { missing: definitions.map((item) => `@${item.name}`) }
+          const index = await tx.doc(Standing, ROOT_CONVERSATION_ID)
+          let id = Object.hasOwn(index, name) ? index[name] : undefined
+          let created: ConversationRecord | undefined
+          if (id === undefined || !(await tx.conversation(id))) {
+            // Created and indexed in one commit; a deleted standing conversation is recreated here.
+            created = await tx.createConversation({ ownership: { kind: 'ownerless' } })
+            id = created.id
+            index[name] = id
           }
-        } else {
-          // Created and indexed in one commit; a deleted standing conversation is recreated here.
-          created = await tx.createConversation({ ownership: { kind: 'ownerless' } })
-          id = created.id
-          index[name] = id
-        }
-        const change = definitionAgent(definition, base, host.modelRuntime)
-        await configure(tx, id, { ...change, cwd: host.projectRoot })
-        Object.assign(await tx.doc(host.metadata, id), { label: 'agent', title: `@${name}` })
-        // A standing agent keeps its `@name`: no automatic title, summary or reply activity.
-        await conversations.setAutomaticSummaries(tx, id, false)
-        await conversations.setStanding(tx, id, true)
-        ;(await tx.doc(Profile, id)).definition = name
-        setMark(await tx.doc(Marks, ROOT_CONVERSATION_ID), definition)
-        // Only a new conversation starts: a refresh reconfigures one that already runs.
-        if (created) await started(host, tx, created, name, 'standing')
-        return id
-      }, ctx)
+          // A new conversation starts on the default model and thinking level; an existing one keeps those chosen in
+          // it, so a refresh changes them only where the definition pins them.
+          const base = { ...main, ...(await hostDefault(host)) }
+          await reconfigure(tx, id, definition, base, host.modelRuntime)
+          await configure(tx, id, { cwd: host.projectRoot })
+          Object.assign(await tx.doc(host.metadata, id), { label: 'agent', title: `@${name}` })
+          // A standing agent keeps its `@name`: no automatic title, summary or reply activity.
+          await conversations.setAutomaticSummaries(tx, id, false)
+          await conversations.setStanding(tx, id, true)
+          setMark(await tx.doc(Marks, ROOT_CONVERSATION_ID), definition)
+          // Only a new conversation starts: a refresh reconfigures one that already runs.
+          if (created) await started(host, tx, created, name, 'standing')
+          return { id }
+        }, ctx)
+      if ('missing' in result) {
+        await pruneRetired(ctx)
+        throw new Error(
+          `Unknown standing agent @${name}. Standing agents: ${result.missing.join(', ') || 'none'}`,
+        )
+      }
+      return result.id
     },
-  })
+  }
+  host.implement(SubagentsApi, service)
   /**
    * The definition a `start` runs: the named one with the call's family, model and thinking over its own, or, without
    * `agent`, one made on the fly from the call (`label`, neutral instructions plus the caller's, the parent's tools or a
@@ -845,6 +849,15 @@ export default function subagents(
   })
   host.onOpen(async () => {
     await pruneRetired(BACKGROUND_CONTEXT)
+    // Every resident definition has its conversation from the start, in a fresh project and a new chapter alike, so
+    // the sidebar lists each one before anything addresses it (#568566). Creating one runs no turn. @ultimate keeps its
+    // own start: its row shows before it exists, the first page or Get ready makes it, and its start brings dream's
+    // automations.
+    for (const { name } of await residentDefinitions())
+      if (name !== 'ultimate')
+        await service
+          .standing(name, BACKGROUND_CONTEXT)
+          .catch((error: unknown) => host.notice(`Standing agent @${name}: ${String(error)}`))
     unsubscribe?.()
     // Not a reactor: subagent answers settle as Pi submission records, not domain events. Committed submissions are
     // observed live here and scanned once on open, so a restart neither loses nor duplicates a report.
@@ -920,32 +933,39 @@ export default function subagents(
       }),
     ],
     sections: [
-      section('subagent_state', async (input, context) => {
-        const state = await input.read.snapshot(Subagents, input.conversationId, context)
-        const running: string[] = []
-        const pending = new Set<ConversationId>()
-        for (const action of Object.values(state?.actions ?? {}))
-          if (
-            action.status === undefined &&
-            (await host.harness().getTask(action.reporter, context))?.state.status !== 'terminal'
-          )
-            pending.add(action.conversationId)
-        const queued: string[] = []
-        for (const agent of Object.values(state?.agents ?? {})) {
-          const label = `${agent.conversationId} (${agent.agent})`
-          if (
-            (await input.read.snapshot(LiveDoc, agent.conversationId, context))?.run !== undefined
-          )
-            running.push(label)
-          else if (pending.has(agent.conversationId)) queued.push(label)
-        }
-        if (!running.length && !queued.length) return undefined
-        return [
-          ...(running.length ? [`Still running subagents: ${running.join(', ')}.`] : []),
-          ...(queued.length ? [`Pending subagent inputs: ${queued.join(', ')}.`] : []),
-          'A yielded wait is not a child answer. Use message, stop, or wait with these IDs; parent stop does not stop them. Queued inputs are delivered only at the normal boundary; do not act on them early.',
-        ].join(' ')
-      }),
+      // Empty, not undefined, when idle: the slot keeps its place, so coming back patches only this section
+      // (Pi re-sends every section when one would land out of order, #573861).
+      section(
+        'subagent_state',
+        async (input, context) => {
+          const state = await input.read.snapshot(Subagents, input.conversationId, context)
+          const running: string[] = []
+          const pending = new Set<ConversationId>()
+          for (const action of Object.values(state?.actions ?? {}))
+            if (
+              action.status === undefined &&
+              (await host.harness().getTask(action.reporter, context))?.state.status !== 'terminal'
+            )
+              pending.add(action.conversationId)
+          const queued: string[] = []
+          for (const agent of Object.values(state?.agents ?? {})) {
+            const label = `${agent.conversationId} (${agent.agent})`
+            if (
+              (await input.read.snapshot(LiveDoc, agent.conversationId, context))?.run !== undefined
+            )
+              running.push(label)
+            else if (pending.has(agent.conversationId)) queued.push(label)
+          }
+          if (!running.length && !queued.length) return ''
+          const text = [
+            ...(running.length ? [`Still running subagents: ${running.join(', ')}.`] : []),
+            ...(queued.length ? [`Pending subagent inputs: ${queued.join(', ')}.`] : []),
+            'A yielded wait is not a child answer. Use message, stop, or wait with these IDs; parent stop does not stop them. Queued inputs are delivered only at the normal boundary; do not act on them early.',
+          ].join(' ')
+          return `<subagent_state>\n${text}\n</subagent_state>`
+        },
+        { tag: false },
+      ),
       section('subagents', async (input) => {
         const usesDefinitions = input.agent.tools.some((tool) =>
           ['subagent', 'branch', 'automation'].includes(tool.name),
@@ -971,8 +991,9 @@ export default function subagents(
         name: 'subagent',
         description:
           'Delegate to a named agent. start returns its answer (foreground) or id (background). Foreground start/message and wait yield on queued steering with details.yielded:true; work continues independently. Stop children explicitly; stopping the parent does not stop them; stop lists files left uncommitted in the child worktree. message steers a busy child (steer false queues a follow-up instead); wait returns the latest answer; stop stops current work; list shows your children; land verifies and fast-forwards a finished worktree child; discard removes its worktree but keeps its branch. start accepts isolate none or worktree, and fork true to inherit parent history before this call (more context cost; prompt caching usually covers the shared prefix). Background answers join the current run after its tool round, or wake you when idle.',
-        // Call-id receipts deduplicate starts/messages; memoized targets and guards protect stop/workspace replays.
-        replay: 'safe',
+        ...safeToRerun(
+          'Call-id receipts deduplicate starts/messages; memoized targets and guards protect stop/workspace replays.',
+        ),
         parameters: obj({
           action: strEnum(['start', 'message', 'wait', 'stop', 'list', 'land', 'discard']),
           agent: opt(
@@ -1043,7 +1064,7 @@ export default function subagents(
             await api.memo('workspace-operation', true, context)
             const operation = args.action
             return finish(
-              JSON.stringify(await workspaces[operation](args.id as ConversationId, context)),
+              JSON.stringify(await workspaces[operation](parseConversationId(args.id!), context)),
             )
           }
           if (args.action === 'start' || args.action === 'message') {
@@ -1077,7 +1098,7 @@ export default function subagents(
                 ? '\nWarning: parent has uncommitted changes; they are not in the worktree.'
                 : ''
             const task = await api.getTask(api.taskId, context)
-            // Pi upstream: @earendil-works/pi-durable@1.5.0 src/harness/tool.ts — internal ToolTaskInput.assistant locates the calling assistant. Drop when ToolExecutionApi exposes the calling assistant entry ID.
+            // Pi upstream: @earendil-works/pi-durable@1.5.2 src/harness/tool.ts — internal ToolTaskInput.assistant locates the calling assistant. Drop when ToolExecutionApi exposes the calling assistant entry ID.
             const assistant = (task?.input as { assistant: EntryId } | undefined)?.assistant
             // A fork copies the parent's visible history up to the entry before the calling assistant message. Documents
             // follow their fork policy: `pi.agent`, `codemode.store` and `ultimate.ui` copy as of that entry (the web
@@ -1095,7 +1116,7 @@ export default function subagents(
             const action = await api.commit(async (tx) => {
               const state = await tx.doc(Subagents, api.conversationId)
               if (state.actions[api.callId]) return { ...state.actions[api.callId] }
-              let conversationId = args.id as ConversationId
+              let conversationId: ConversationId
               if (definition) {
                 await conversations.requestSummary(
                   tx,
@@ -1147,7 +1168,7 @@ export default function subagents(
                     instructions: `${definition.instructions}\nWork only in ${workspace.path} on ${workspace.branch}, cut from ${workspace.base}. Commit your work on this branch with clear messages. Never push and never touch other checkouts.`,
                   })
                 }
-              }
+              } else conversationId = parseConversationId(args.id!)
               const reporter = await tx.createTask(
                 Reporter,
                 {
@@ -1209,7 +1230,7 @@ export default function subagents(
               ),
             )
           }
-          const id = args.id as ConversationId
+          const id = parseConversationId(args.id!)
           const info = details(id, index.agents[String(id)].background)
           await api.details(info, context)
           if (args.action === 'stop') {
@@ -1227,7 +1248,7 @@ export default function subagents(
                 )
                 tasks.push(
                   ...page.items.filter(
-                    (task) => (task.input as { conversation?: number }).conversation === id,
+                    (task) => (task.input as { conversation?: ConversationId }).conversation === id,
                   ),
                 )
                 cursor = page.next

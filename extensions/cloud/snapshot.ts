@@ -1,14 +1,14 @@
 // Encrypted, chunked project backups in the cloud's private R2: a consistent database copy plus a bundle of the
 // `ultimate/*` branches. Everything is compressed and sealed on the machine; the Worker stores only ciphertext.
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto'
-import { createReadStream, createWriteStream } from 'node:fs'
-import { mkdtemp, rename, rm, stat } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { mkdtemp, open as openFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { setTimeout as sleep } from 'node:timers/promises'
 import { createZstdCompress, createZstdDecompress } from 'node:zlib'
+import { pace } from '../../lib/timers.ts'
 import { vacuum } from '../../lib/database-files.ts'
 import { git as gitIn } from '../../lib/git.ts'
 
@@ -254,6 +254,10 @@ async function open(
 ) {
   const hash = createHash('sha256')
   let bytes = 0
+  // Open before the pipeline starts: createWriteStream(path) opens the file later on the threadpool, so a first chunk
+  // that fails verification at once can reject the pipeline first, and the queued open recreates an empty file after
+  // the caller's rm (seen as a leftover .part in the 'rejects reordered chunks' test under load).
+  const out = await openFile(file, 'w')
   await pipeline(
     Readable.from(
       (async function* () {
@@ -272,7 +276,7 @@ async function open(
         yield data
       }
     },
-    createWriteStream(file),
+    out.createWriteStream(),
     { signal: o.signal },
   )
   if (bytes !== part.bytes || hash.digest('hex') !== part.sha256)
@@ -310,7 +314,7 @@ async function request(o: Remote, id: string, name: string, init: RequestInit) {
     if (response && (response.status < 500 || attempt === 3))
       throw new Error(`Snapshot ${name} returned ${response.status}`)
     await response?.body?.cancel()
-    await sleep(1000 * attempt, undefined, { signal: o.signal })
+    await pace(1000 * attempt, o.signal)
   }
 }
 async function put(o: Remote, id: string, name: string, data: Buffer) {

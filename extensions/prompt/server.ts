@@ -1,3 +1,5 @@
+import { parseConversationId } from '../../lib/ids.ts'
+import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 import { createHash } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
@@ -12,11 +14,11 @@ import {
   ROOT_CONVERSATION_ID,
   section,
 } from '@earendil-works/pi-durable'
-import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import type { ConversationSummary } from '../../shared/protocol.ts'
 import { discoverAgents } from '../../lib/agents.ts'
 import { git } from '../../lib/git.ts'
+import { ignoring, isMissing, meansNone } from '../../lib/errors.ts'
 import { shortTitle } from '../../lib/title.ts'
 import { Standing } from '../subagents/api.ts'
 import type { BuildNote, Landing } from './refs.ts'
@@ -84,7 +86,10 @@ export async function landings(
   for (const record of log.split('\x1e')) {
     const [sha, subject, trailer] = record.trim().split('\0')
     if (!sha) continue
-    let id = Number(trailer?.trim()) || Number(/ from #(\d+) into /.exec(subject)?.[1]) || undefined
+    let id =
+      parseConversationId(
+        Number(trailer?.trim()) || Number(/ from #(\d+) into /.exec(subject)?.[1]),
+      ) || undefined
     // An owned conversation (a worker, a designer) worked for its owner's branch.
     for (let owner = id && byId.get(id)?.parentConversationId; owner;) {
       id = owner
@@ -117,8 +122,7 @@ async function cloneDocs(ultimateRoot: string, files: Record<string, string>) {
     ...(await listed('agents')),
   ]
   for (const path of paths) {
-    // A doc removed between the listing and the read is simply not there.
-    const text = await readFile(path, 'utf8').catch(() => undefined)
+    const text = await readFile(path, 'utf8').catch(ignoring(isMissing))
     if (text !== undefined) files[path] = digest(text)
   }
 }
@@ -211,7 +215,7 @@ export default function prompt(host: ExtensionHost) {
   return defineExtension({
     name: 'prompt',
     hooks: [
-      // Pi upstream: @earendil-works/pi-durable@1.5.0 — patched transactional beforeInput hook.
+      // Pi upstream: @earendil-works/pi-durable@1.5.2 — patched transactional beforeInput hook.
       // The build is a note on the input that starts a run, not a system-prompt section: every hot reload changed that
       // section, and a changed system prompt rewrites the whole prompt cache. A conversation's first run records it.
       hook(GenerationTask, {
@@ -224,8 +228,7 @@ export default function prompt(host: ExtensionHost) {
           const built = previous !== undefined && previous !== build.id
           let landed: Landing[] = []
           if (seen.head === undefined || built) {
-            // Outside Git the build changes without commits: no landings to name.
-            const head = await git(host.ultimateRoot, 'rev-parse', 'HEAD').catch(() => undefined)
+            const head = await git(host.ultimateRoot, 'rev-parse', 'HEAD').catch(meansNone)
             if (built && head && seen.head && head !== seen.head)
               landed = await landings(
                 host.ultimateRoot,
@@ -297,7 +300,7 @@ export default function prompt(host: ExtensionHost) {
             ') and test new behaviour before relying on it. An "Instructions changed" or "Docs changed" line means those files changed: your system prompt already carries changed instructions; re-read changed docs before relying on them.',
         ].join('\n')
       }),
-      // Pi upstream: @earendil-works/pi-coding-agent@1.5.0 src/core/system-prompt.ts and src/core/tools/*.ts — copied tool guidance adapted from unexported prompt contributions. Drop when Pi exports buildSystemPromptSections and the per-tool system prompt contributions.
+      // Pi upstream: @earendil-works/pi-coding-agent@1.5.2 src/core/system-prompt.ts and src/core/tools/*.ts — copied tool guidance adapted from unexported prompt contributions. Drop when Pi exports buildSystemPromptSections and the per-tool system prompt contributions.
       section('tools', (input) => {
         const guidance: Record<string, string> = {
           read: '- read: inspect files, with offset/limit for large files.',
@@ -337,22 +340,30 @@ export default function prompt(host: ExtensionHost) {
           ? `${listed}\nWhen a task matches a listed skill, read it before you start; it carries the steps the project expects.`
           : undefined
       }),
-      section('building_blocks', () => {
-        const off = host.extensions().filter((extension) => !extension.enabled)
-        if (!off.length) return undefined
-        return [
-          `Available but off building blocks live in ${host.ultimateRoot}/extensions/:`,
-          ...off.map((extension) => {
-            const sentence = extension.readme
-              ?.trim()
-              .split(/(?<=[.!?])\s/)[0]
-              ?.replace(/\s+/g, ' ')
-            return `- ${extension.name}: ${sentence ?? ''}`
-          }),
-          'Enable names with "extensions": { "enable": [...] } in ~/.ultimate/settings.json (this machine) or <project>/.ultimate/settings.json (the host project). Changes apply live with no restart.',
-          `The running host uses ${host.projectRoot}/.ultimate/settings.json and ${host.projectRoot}/.ultimate/extensions/; editing these in a separate work checkout does not change the host's configuration or hot-reload its extensions.`,
-        ].join('\n')
-      }),
+      // Empty, not undefined, when nothing is off: the slot keeps its place, so coming back patches only this section
+      // (Pi re-sends every section when one would land out of order, #573861).
+      section(
+        'building_blocks',
+        () => {
+          const off = host.extensions().filter((extension) => !extension.enabled)
+          if (!off.length) return ''
+          return [
+            '<building_blocks>',
+            `Available but off building blocks live in ${host.ultimateRoot}/extensions/:`,
+            ...off.map((extension) => {
+              const sentence = extension.readme
+                ?.trim()
+                .split(/(?<=[.!?])\s/)[0]
+                ?.replace(/\s+/g, ' ')
+              return `- ${extension.name}: ${sentence ?? ''}`
+            }),
+            'Enable names with "extensions": { "enable": [...] } in ~/.ultimate/settings.json (this machine) or <project>/.ultimate/settings.json (the host project). Changes apply live with no restart.',
+            `The running host uses ${host.projectRoot}/.ultimate/settings.json and ${host.projectRoot}/.ultimate/extensions/; editing these in a separate work checkout does not change the host's configuration or hot-reload its extensions.`,
+            '</building_blocks>',
+          ].join('\n')
+        },
+        { tag: false },
+      ),
       section('environment', (input) => {
         const cwd = input.env?.cwd ?? input.agent.cwd ?? host.projectRoot
         const os = process.platform === 'darwin' ? 'macOS' : process.platform

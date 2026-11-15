@@ -25,6 +25,7 @@
     "shared/extension-api.ts",
     "extensions/*/refs.ts",
     "extensions/messages/caller.ts",
+    "extensions/projects/links.ts",
     "extensions/cloud/types.ts",
     "extensions/conversations/types.ts",
     "extensions/dream/stage.ts",
@@ -44,6 +45,7 @@
     "extensions/sounds/conductor.ts",
     "extensions/sounds/engine.ts",
     "extensions/sounds/narration.ts",
+    "extensions/sounds/speaker.ts",
     "extensions/instance/links.ts",
     "extensions/update/item.ts",
     "extensions/attachments/limits.ts",
@@ -53,7 +55,6 @@
     "extensions/sidebar/landings.ts",
     "extensions/subagents/landing.ts",
     "extensions/onboarding/onboarded.ts",
-    "extensions/sidebar/label.ts",
     "extensions/tasks/kinds.ts",
     "extensions/sidebar/listed.ts",
     "extensions/side-chat/logic.ts",
@@ -75,7 +76,11 @@
     "lib/marks.ts",
     "lib/message-state.ts",
     "lib/source-frames.ts",
+    "lib/timers.ts",
+    "lib/errors.ts",
+    "lib/ids.ts",
     "extensions/subagents/message-types.ts",
-    "test/web"
+    "test/web",
+    "extensions/*/test/web"
   ]
 }

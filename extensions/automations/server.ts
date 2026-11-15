@@ -1,10 +1,12 @@
+import { parseConversationId, parseTaskId } from '../../lib/ids.ts'
+import type { TaskId, Tx, ConversationId } from '@earendil-works/pi-durable'
 import { constants } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { access, link, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
-import type { JsonValue } from '@earendil-works/chord'
+import type { JsonValue } from '@earendil-works/chord/json'
 import { arr, bool, int, lit, map, num, obj, opt, str, union } from '@earendil-works/pi-schema'
 import { strEnum } from '../../lib/schema.ts'
 import {
@@ -17,18 +19,18 @@ import {
   ROOT_CONVERSATION_ID,
   section,
 } from '@earendil-works/pi-durable'
-import type { TaskId, Tx, ConversationId } from '@earendil-works/pi-durable'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import type { ActionContext } from '../../server/actions.ts'
 import { EVENT_FEED } from '../../shared/events.ts'
 import type { EventRecord } from '../../shared/events.ts'
 import { implementAction } from '../../lib/actions.ts'
 import { actingAs } from '../../lib/acting-as.ts'
+import { errnoCode, isMissing } from '../../lib/errors.ts'
 import { discoverAgents } from '../../lib/agents.ts'
 import { validateName } from '../../lib/secrets.ts'
 import { groupAlive } from '../../lib/process-group.ts'
 import { writeJson } from '../../lib/json-file.ts'
-import { SubagentsApi } from '../subagents/api.ts'
+import { Standing, SubagentsApi } from '../subagents/api.ts'
 import { MessagesApi } from '../messages/api.ts'
 import { LineageApi } from '../lineage/api.ts'
 import { AutomationsApi } from './api.ts'
@@ -63,6 +65,7 @@ import type {
   Subscriber,
 } from './types.ts'
 import { isSlug, STANDING } from './types.ts'
+import { safeToRerun } from '../../lib/replay.ts'
 export type { Automation, Run } from './types.ts'
 export { launchHandshake } from './supervisor.ts'
 type Ledger = { next: number; automations: Record<string, Automation> }
@@ -153,11 +156,11 @@ function backend(host: ExtensionHost) {
   /** A subscriber as stored: `#id` and numbers become the conversation id, `@name` stays the standing agent's name. */
   async function subscriber(value: unknown): Promise<Subscriber> {
     if (typeof value === 'number' || (typeof value === 'string' && /^#[1-9]\d*$/.test(value))) {
-      const id = typeof value === 'number' ? value : Number(value.slice(1))
+      const id = parseConversationId(typeof value === 'number' ? value : Number(value.slice(1)))
       if (
         !Number.isInteger(id) ||
         id < 1 ||
-        !(await host.harness().conversation(id as ConversationId, BACKGROUND_CONTEXT))
+        !(await host.harness().conversation(id, BACKGROUND_CONTEXT))
       )
         throw new Error(`Unknown subscriber #${id}`)
       return id
@@ -174,7 +177,7 @@ function backend(host: ExtensionHost) {
     }
     throw new Error('subscribers must be #id or @name')
   }
-  async function prepareScript(args: Args, caller?: number): Promise<Prepared> {
+  async function prepareScript(args: Args, caller?: ConversationId): Promise<Prepared> {
     if (args.action === 'create') {
       if (!caller) throw new Error('create requires a caller conversation')
       if (args.scope !== 'project') {
@@ -186,7 +189,7 @@ function backend(host: ExtensionHost) {
       if (args.to !== undefined && !STANDING.test(args.to))
         throw new Error('A project automation wakes a standing agent: to must be @name')
       // The caller becomes a subscriber; discovery configures the watcher from @ultimate.
-      if (!(await host.harness().conversation(caller as ConversationId, BACKGROUND_CONTEXT)))
+      if (!(await host.harness().conversation(caller, BACKGROUND_CONTEXT)))
         throw new Error(`Unknown caller #${caller}`)
       const slug =
         args.slug ??
@@ -238,7 +241,7 @@ function backend(host: ExtensionHost) {
         try {
           await link(draft, path)
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+          if (errnoCode(error) !== 'EEXIST') throw error
           const found = manifest(JSON.parse(await readFile(path, 'utf8')))
           if (JSON.stringify(found) !== JSON.stringify(committed)) throw taken()
         } finally {
@@ -288,18 +291,31 @@ function backend(host: ExtensionHost) {
       if (args.action === 'unsubscribe' && args.to !== undefined) {
         if (!/^#[1-9]\d*$/.test(args.to) && !STANDING.test(args.to))
           throw new Error('to must be #id or @name')
-        prepared.subscriber = args.to.startsWith('#') ? Number(args.to.slice(1)) : args.to
+        prepared.subscriber = args.to.startsWith('#')
+          ? parseConversationId(Number(args.to.slice(1)))
+          : args.to
         return prepared
       }
       prepared.subscriber = await subscriber(args.to ?? caller)
     }
     return prepared
   }
+  /**
+   * Made while @ultimate owes an agent's request ("I've started it"), a new automation serves it like a branch: the run
+   * its first fire wakes in @ultimate answers that agent (ultimate-eval #53/5281). Only @ultimate's answers route that
+   * way (messages' route.ts).
+   */
+  async function served(tx: Tx, caller?: ConversationId) {
+    if (caller === undefined || (await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate !== caller)
+      return {}
+    const serves = await host.need(MessagesApi).owed(tx, caller)
+    return serves ? { serves: { ...serves, by: caller } } : {}
+  }
   async function changeScript(
     tx: Tx,
     args: Args,
     prepared: Prepared,
-    caller?: number,
+    caller?: ConversationId,
   ): Promise<{ result: JsonValue; effect?: Effect }> {
     const state = await tx.doc(Automations)
     if (args.action === 'list')
@@ -340,6 +356,7 @@ function backend(host: ExtensionHost) {
             ]),
           ],
           ...(args.key ? { key: args.key } : {}),
+          ...(await served(tx, caller)),
         })
         sub.script!.state = 'writing'
         await deliver(tx, sub, 'create', 'writing', sub.script!.ask)
@@ -351,7 +368,7 @@ function backend(host: ExtensionHost) {
         prepared,
         id,
         name,
-        (await tx.doc(AgentDoc, caller as ConversationId)).cwd ?? host.projectRoot,
+        (await tx.doc(AgentDoc, caller!)).cwd ?? host.projectRoot,
       )
       const now = Date.now()
       const sub: Automation = {
@@ -376,6 +393,7 @@ function backend(host: ExtensionHost) {
         updatedAt: now,
         runs: [],
         fires: 0,
+        ...(await served(tx, caller)),
       }
       state.automations[id] = sub
       await deliver(tx, sub, 'create', 'writing', sub.script!.ask)
@@ -421,7 +439,7 @@ function backend(host: ExtensionHost) {
     return { result: sub }
   }
 
-  async function validate(args: Args, caller?: number) {
+  async function validate(args: Args, caller?: ConversationId) {
     if (!host.extensions().some((e) => e.name === 'subagents' && e.enabled))
       throw new Error('automations needs the subagents extension enabled')
     if (!operations.includes(args.action as (typeof operations)[number]))
@@ -503,7 +521,7 @@ function backend(host: ExtensionHost) {
       if (args.ask !== undefined) required(args.ask, 'ask')
     }
   }
-  async function prepare(args: Args, caller?: number): Promise<Prepared> {
+  async function prepare(args: Args, caller?: ConversationId): Promise<Prepared> {
     // A key that already made an automation is answered from it before anything else runs: validation may make a
     // standing agent's conversation, and preparation may publish a manifest. The transaction checks it is still there.
     if (
@@ -544,7 +562,7 @@ function backend(host: ExtensionHost) {
     tx: Tx,
     args: Args,
     prepared: Awaited<ReturnType<typeof prepare>>,
-    caller?: number,
+    caller?: ConversationId,
   ): Promise<Change> {
     if (args.action === 'events') return { result: json(TRIGGER_EVENTS) }
     const state = await tx.doc(Automations)
@@ -576,6 +594,7 @@ function backend(host: ExtensionHost) {
           : args.prompt
             ? []
             : [caller!],
+        ...(await served(tx, caller)),
       }
     }
     const a = state.automations[id]
@@ -586,7 +605,7 @@ function backend(host: ExtensionHost) {
     if (args.action === 'abort') {
       const run = a.runs.find((r) => r.id === args.runId)
       if (!run || run.status !== 'running') throw new Error('runId must identify a running run')
-      return { result: { id: run.id }, abort: Number(run.id) as TaskId }
+      return { result: { id: run.id }, abort: parseTaskId(Number(run.id)) }
     }
     if (
       ['subscribe', 'unsubscribe'].includes(args.action) ||
@@ -694,7 +713,7 @@ function backend(host: ExtensionHost) {
     if (receipt.abort) await host.harness().abortTask(receipt.abort, BACKGROUND_CONTEXT)
     await scripts.apply(receipt.effect)
   }
-  async function operate(args: Args, caller?: number): Promise<JsonValue> {
+  async function operate(args: Args, caller?: ConversationId): Promise<JsonValue> {
     const prepared = await prepare(args, caller)
     const receipt = await host
       .harness()
@@ -784,7 +803,7 @@ export const actions = {
       const text = await readFile(path, 'utf8')
       return { path, text: text.length > 65536 ? `${text.slice(0, 65536)}\n…` : text }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { path, text: '' }
+      if (isMissing(error)) return { path, text: '' }
       throw error
     }
   }),
@@ -846,25 +865,31 @@ export default function automations(host: ExtensionHost) {
       }),
     ],
     sections: [
-      section('automations', async ({ read }, context) => {
-        const state = await read.snapshot(Automations, context)
-        const lines = Object.values(state?.automations ?? {})
-          .filter((a) => a.enabled)
-          .map((a) => `${a.id} ${a.name}: ${describeTrigger(a)}`)
-        // Always rendered: a section that disappears and reappears reorders the prompt, which rebuilds it whole.
-        return lines.length ? lines.join('\n') : 'None enabled.'
-      }),
+      // Empty, not undefined, with none enabled: the slot keeps its place, so coming back patches only this section
+      // (Pi re-sends every section when one would land out of order, #573861).
+      section(
+        'automations',
+        async ({ read }, context) => {
+          const state = await read.snapshot(Automations, context)
+          const lines = Object.values(state?.automations ?? {})
+            .filter((a) => a.enabled)
+            .map((a) => `${a.id} ${a.name}: ${describeTrigger(a)}`)
+          return lines.length ? `<automations>\n${lines.join('\n')}\n</automations>` : ''
+        },
+        { tag: false },
+      ),
     ],
     tools: [
       defineTool({
         name: 'automation',
-        // Receipts deduplicate ledger changes; process effects reuse their committed pid on replay.
-        replay: 'safe',
+        ...safeToRerun(
+          'Receipts deduplicate ledger changes; process effects reuse their committed pid on replay.',
+        ),
         // Calls in one round apply in the order written: a parallel unsubscribe could otherwise commit before the
         // subscribe meant to replace it and be refused for leaving nobody to wake.
         executionMode: 'sequential',
         description:
-          'Automate background work: one trigger (schedule, ask, event or condition) and one or both actions (prompt, subscribers: #id|@name). create {name, trigger, prompt?, subscribers?, key?, …}; with neither action the caller subscribes. To be reminded or woken, subscribe (cheap); add a prompt only when fresh work must run (a whole agent turn every fire). schedule: cron "0 9 * * 1-5" Europe/Vienna, at <ISO time>, in 30m, every 15m. ask: a watcher writes a supervised script that fires on stdout FIRE (tokens only for setup and repair). event {name,where?}: action events lists them. condition {metric:"context",of:"@name"|"#id",above}. list; these take {id}: update, pause, resume, run, runs, log, abort {runId}, escalate {reason}, subscribe/unsubscribe {to?}, delete. Details: extensions/automations/README.md in the Ultimate clone.',
+          'Automate background work: one trigger (schedule, ask, event or condition) and one or both actions (prompt, subscribers: #id|@name). create {name, trigger, prompt?, subscribers?, key?, …}; with neither action the caller subscribes. To be reminded or woken, subscribe (cheap); add a prompt only when fresh work must run (a whole agent turn every fire). schedule: cron "0 9 * * 1-5" Europe/Vienna, at <ISO time>, in 30m, every 15m. ask: a watcher writes a supervised script that fires on stdout FIRE (tokens only for setup and repair); once defaults to true, so the first FIRE finishes it: pass once:false to keep watching. event {name,where?}: action events lists them. condition {metric:"context",of:"@name"|"#id",above}. list; these take {id}: update, pause, resume, run, runs, log, abort {runId}, escalate {reason}, subscribe/unsubscribe {to?}, delete. Details: extensions/automations/README.md in the Ultimate clone.',
         parameters: obj({
           action: strEnum(operations),
           id: opt(str()),
@@ -903,7 +928,13 @@ export default function automations(host: ExtensionHost) {
           lines: opt(int({ minimum: 1, maximum: 2000 })),
           reason: opt(str()),
         }),
-        execute: async (args, tool, context) => {
+        execute: async (rawArgs, tool, context) => {
+          const args: Args = {
+            ...rawArgs,
+            subscribers: rawArgs.subscribers?.map((id) =>
+              typeof id === 'number' ? parseConversationId(id) : id,
+            ),
+          }
           const cached = await tool.memo<{ output: { type: 'text'; text: string }[] }>(
             'result',
             context,

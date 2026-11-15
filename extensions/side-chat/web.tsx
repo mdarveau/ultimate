@@ -1,4 +1,6 @@
-import type { EntryRecord } from '@earendil-works/pi-durable'
+import type { EntryRecord, ConversationId } from '@earendil-works/pi-durable'
+import { ROOT } from '@/sdk'
+import { deadline } from '../../lib/timers.ts'
 import {
   ArrowLeftIcon,
   GitForkIcon,
@@ -17,6 +19,7 @@ import {
   api,
   Card,
   cn,
+  column,
   ComposerRedirect,
   Conversation,
   ConversationScope,
@@ -62,7 +65,7 @@ const sideEndings = createEndings(errorMessage)
 
 /** @ultimate's conversation id, and the side chats it has. */
 function useMain() {
-  const main = useDocOf(1, StandingDoc)?.ultimate
+  const main = useDocOf(ROOT, StandingDoc)?.ultimate
   const index = useDocOf(main, SideChatsDoc) ?? undefined
   return { main, index }
 }
@@ -149,7 +152,7 @@ function SideComposer({ core, dock }: { core: ReactNode; dock?: boolean }) {
       {/* Covered by a side chat in front, main's composer and its controls take no focus, typing or clicks. */}
       <div data-main-composer={active || undefined} inert={!!shown}>
         <div
-          className="mx-auto flex w-full max-w-(--reading-width,46rem) items-center justify-between gap-2 px-3 pb-1.5 sm:px-6"
+          className={cn(column(), 'flex items-center justify-between gap-2 pb-1.5')}
           hidden={!active}
         >
           <div
@@ -208,7 +211,7 @@ function SideComposer({ core, dock }: { core: ReactNode; dock?: boolean }) {
 function MainBlocked({ onBack }: { onBack: () => void }) {
   return (
     <div className="absolute inset-0 z-10 flex items-center bg-background/70 backdrop-blur-[1px]">
-      <div className="mx-auto w-full max-w-(--reading-width,46rem) px-3 sm:px-6">
+      <div className={column()}>
         <div className="flex w-fit items-center gap-3 rounded-lg border border-border bg-card px-3.5 py-2 font-mono text-[11.5px] text-muted-foreground shadow-sm">
           <GitForkIcon className="size-3.5 text-brand" />
           <span>Typing goes to the side chat</span>
@@ -239,12 +242,11 @@ function Stage() {
   const isMain = id !== undefined && id === main
   const current = isMain ? frontSide(front, index) : undefined
   // The last side chat stays mounted while its sheet leaves.
-  const [shown, setShown] = useState<number>()
+  const [shown, setShown] = useState<ConversationId>()
   if (current && shown !== current.id) setShown(current.id)
   useEffect(() => {
     if (current) return undefined
-    const timer = setTimeout(() => setShown(undefined), duration + 60)
-    return () => clearTimeout(timer)
+    return deadline(duration + 60, () => setShown(undefined))
   }, [current])
 
   useLayoutEffect(() => {
@@ -264,10 +266,14 @@ function Stage() {
       (child): child is HTMLElement => child instanceof HTMLElement && !child.contains(ref.current),
     )
     const still = reduced()
-    const column = Math.min(736, width)
+    // The column as laid out, so a `--reading-width` set by the user moves it to the same resting place.
+    const reading = layers
+      .map((layer) => layer.querySelector<HTMLElement>('[data-ui="transcript"]'))
+      .find(Boolean)
+    const columnWidth = reading?.offsetWidth ?? width
     const scale = phone ? 0.92 : 0.88
     // Main's column comes to rest near the region's left edge, beside the sheet.
-    const shift = phone ? 0 : Math.min(0, 24 - (width / 2 - (column / 2) * scale))
+    const shift = phone ? 0 : Math.min(0, 24 - (width / 2 - (columnWidth / 2) * scale))
     for (const layer of layers) {
       layer.style.transition = still
         ? `opacity ${duration}ms ease`
@@ -507,7 +513,7 @@ function SummaryCard({ entry }: { entry: EntryRecord }) {
 // ---- sidebar: open side chats under @ultimate ----------------------------------------------------------------------
 
 /** Rows for @ultimate's open side chats; clicking one brings it to the front, or parks it when it already is. */
-function useSideRows(main: number | undefined): ReactNode {
+function useSideRows(main: ConversationId | undefined): ReactNode {
   const index = useDocOf(main, SideChatsDoc) ?? undefined
   const [front, setFront] = useFront()
   const actions = useUltimate()
@@ -532,7 +538,6 @@ function useSideRows(main: number | undefined): ReactNode {
               if (inFront) return setFront(null)
               setFront(item.id)
               if (actions.conversationId === main) return
-              // oxlint-disable-next-line typescript/no-floating-promises -- an uncaught action failure becomes a notice.
               void talkToUltimate(actions)
             }}
             type="button"
@@ -557,7 +562,7 @@ function useSideRows(main: number | undefined): ReactNode {
 }
 
 /** Every side chat of @ultimate, open or ended: none is a row of the sidebar's own sections. */
-function useSideIds(main: number | undefined): ReadonlySet<number> {
+function useSideIds(main: ConversationId | undefined): ReadonlySet<number> {
   const sides = (useDocOf(main, SideChatsDoc) ?? undefined)?.sides
   return useMemo(() => new Set(sides?.map((side) => side.id)), [sides])
 }

@@ -1,4 +1,6 @@
 import type { ComponentType } from 'react'
+import { deadline } from '../../../lib/timers.ts'
+import type { Cancel } from '../../../lib/timers.ts'
 import type { ConversationSummary } from '../../../shared/protocol.ts'
 import { events } from './events.ts'
 import { errorMessage } from './format.ts'
@@ -114,6 +116,7 @@ const shapes: Record<keyof WebExtension, [Check, string]> = {
     ),
     'an array of { id, title, icon?, component, order?, tab? }',
   ],
+  panelBadges: [objectOf(isComponent), 'an object of panel id → badge component'],
   surfaces: [
     arrayOf(
       fields({
@@ -199,7 +202,7 @@ export function createRegistry() {
   let generation = 0
   let pending = new Set<string>()
   let settled = false
-  let deadline: ReturnType<typeof setTimeout> | undefined
+  let cancelDeadline: Cancel | undefined
   let systemReceived = false
   const refreshReady = (timedOut = readiness.timedOut) => {
     const failed = records.filter((record) => record.error).map((record) => record.name)
@@ -216,7 +219,7 @@ export function createRegistry() {
       emit()
     }
     if (becameReady) {
-      clearTimeout(deadline)
+      cancelDeadline?.()
       events.emit('ultimate:ready', { failed, pending: loading, timedOut })
     }
   }
@@ -265,7 +268,7 @@ export function createRegistry() {
     },
     /** Load facets in discovery order (built-in → user → project, then name), dropping missing facets. */
     async setLoaders(loaders: Readonly<Record<string, ExtensionLoader>>) {
-      if (!started) deadline = setTimeout(() => refreshReady(true), 8000)
+      if (!started) cancelDeadline = deadline(8000, () => refreshReady(true))
       started = true
       const current = ++generation
       settled = false
@@ -301,16 +304,6 @@ export function createRegistry() {
         settled = true
         refreshReady()
       }
-    },
-    /** Install a facet loaded on its own. */
-    replace(name: string, module: unknown) {
-      tokens.set(name, {})
-      pending.delete(name)
-      install(name, module)
-    },
-    /** Record a failed load; the previous version stays installed. */
-    fail(name: string, error: unknown) {
-      if (records.some((record) => record.name === name)) fail(name, error)
     },
   }
 }
@@ -363,6 +356,17 @@ export function panelItems(records: readonly ExtensionRecord[]): PanelItem[] {
       (extension?.panels ?? []).map((panel) => ({ ...panel, extension: name, version })),
     )
     .toSorted((a, b) => (a.order ?? 0) - (b.order ?? 0))
+}
+
+/** Every badge on panel `id`'s tab, in discovery order. */
+export function panelBadges(
+  records: readonly ExtensionRecord[],
+  id: string,
+): { extension: string; version: number; component: ComponentType }[] {
+  return records.flatMap((record) => {
+    const component = record.extension?.panelBadges?.[id]
+    return component ? [{ extension: record.name, version: record.version, component }] : []
+  })
 }
 
 /**

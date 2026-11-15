@@ -3,9 +3,11 @@
  * session and its microphone. Voice mode outlasts its sessions: an idle session closes and the mode sleeps until an
  * answer arrives to speak or the user taps resume. Only End leaves it.
  */
+import { deadline, every } from '../../lib/timers.ts'
+import type { Cancel } from '../../lib/timers.ts'
 import { api, errorMessage, events } from '@/sdk'
 import type { ActionRef } from '@/sdk'
-import { playNotes } from '../sounds/ui.tsx'
+import { playNotes, voiceQuestions } from '../sounds/ui.tsx'
 import type { Note } from '../sounds/ui.tsx'
 import { StatusAction } from './refs.ts'
 import type { VoiceStatus } from './refs.ts'
@@ -44,7 +46,7 @@ let session: LiveSession | undefined
 let queued: { text: string; entry?: number }[] = []
 let cancelled = false
 let closing: Promise<void> | undefined
-let ticker: ReturnType<typeof setInterval> | undefined
+let stopTicking: Cancel | undefined
 const listeners = new Set<() => void>()
 
 /**
@@ -133,9 +135,9 @@ function stopHum() {
   out.gain.cancelScheduledValues(now)
   out.gain.setValueAtTime(out.gain.value, now)
   out.gain.linearRampToValueAtTime(0, now + 0.08)
-  setTimeout(() => {
+  deadline(120, () => {
     context.close().catch((error: unknown) => console.warn('Connecting hum close failed', error))
-  }, 120)
+  })
 }
 
 function set(next: Partial<VoiceMode>, failed = false) {
@@ -144,6 +146,8 @@ function set(next: Partial<VoiceMode>, failed = false) {
   if (next.phase === 'starting' && mode.phase !== 'starting') startHum()
   else if (next.phase && next.phase !== 'starting') stopHum()
   mode = { ...mode, ...next }
+  // While voice mode is on, Voice announces questions; the narrator keeps only their sound.
+  voiceQuestions(mode.phase !== 'off')
   // The indicator already shows the phase; a cue the browser refuses is only worth a warning.
   if (cue) playNotes(cue, 0.08).catch((error: unknown) => console.warn('Voice cue failed', error))
   for (const listener of listeners) listener()
@@ -181,7 +185,7 @@ const describe = (error: unknown) => {
 function release(next: VoiceMode['phase'], problem?: string) {
   const current = session
   session = undefined
-  clearInterval(ticker)
+  stopTicking?.()
   set({
     phase: next,
     since: undefined,
@@ -203,7 +207,7 @@ function tick() {
   if (session.analyser.context.state === 'closed') {
     // startLive already released it and recorded the end; the mode sleeps, as after idling.
     session = undefined
-    clearInterval(ticker)
+    stopTicking?.()
     set({
       phase: 'paused',
       since: undefined,
@@ -297,7 +301,7 @@ export async function open(speech?: string, entry?: number): Promise<void> {
   }
   session = started
   if (cancelled) return release('off')
-  ticker = setInterval(tick, TICK_MS)
+  stopTicking = every(TICK_MS, tick)
   set({ phase: 'live', since: Date.now() })
   try {
     if (mode.muted) started.mute()
@@ -348,7 +352,6 @@ export function hear(text: string, entry?: number) {
   else if (mode.phase === 'paused') {
     // Without an earlier gesture on this page the browser keeps the microphone and audio shut: ask for a tap.
     if (navigator.userActivation && !navigator.userActivation.hasBeenActive) set({ waiting: text })
-    // oxlint-disable-next-line typescript/no-floating-promises -- open never rejects: its failures become `problem`.
     else void open(text, entry)
   }
 }

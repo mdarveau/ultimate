@@ -1,4 +1,5 @@
-import type { Context } from '@earendil-works/chord'
+import type { HookApi, ConversationId } from '@earendil-works/pi-durable'
+import type { Context } from '@earendil-works/chord/context'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import type {
   Api,
@@ -8,7 +9,6 @@ import type {
   Models,
 } from '@earendil-works/pi-ai'
 import { defineExtension, GenerationTask, hook, ProviderDoc } from '@earendil-works/pi-durable'
-import type { HookApi } from '@earendil-works/pi-durable'
 import { traceContext } from './trace.ts'
 import type { CallTrace } from './trace.ts'
 
@@ -23,7 +23,7 @@ export const MAX_WHITESPACE_RUN = 1000
 /** Records one model call: the trace's `begin`, and the conversation of a provider session id, when known. */
 export type ModelTrace = {
   begin: CallTrace['begin']
-  conversationOf(sessionId: string | undefined): number | undefined
+  conversationOf(sessionId: string | undefined): ConversationId | undefined
 }
 
 /**
@@ -33,7 +33,7 @@ export type ModelTrace = {
  * in this process (a compaction right after a restart) and extensions' own calls stay unlinked.
  */
 export function modelTrace(trace: Pick<CallTrace, 'begin'>) {
-  const sessions = new Map<string, number>()
+  const sessions = new Map<string, ConversationId>()
   const remember = async (api: HookApi, context: Context) => {
     const provider = await api.snapshot(ProviderDoc, api.conversationId, context)
     if (!provider) return
@@ -226,7 +226,7 @@ export function guardStream(
           const call = event.partial.content[event.contentIndex]
           const name = call?.type === 'toolCall' ? `${call.name} ` : ''
           // Pi's retry classification matches "you can retry your request"; a new sample rarely degenerates again.
-          // Pi upstream: @earendil-works/pi-ai@1.5.0 src/utils/retry.ts — RETRYABLE_PROVIDER_ERROR_PATTERN decides which errors a generation retries. Drop when Pi Durable lets a stream mark its error retryable.
+          // Pi upstream: @earendil-works/pi-ai@1.5.2 src/utils/retry.ts — RETRYABLE_PROVIDER_ERROR_PATTERN decides which errors a generation retries. Drop when Pi Durable lets a stream mark its error retryable.
           const errorMessage = `Aborted degenerate tool-call arguments: ${name}arguments contain more than ${MAX_WHITESPACE_RUN} whitespace characters in a row; you can retry your request`
           fail(errorMessage)
           return
