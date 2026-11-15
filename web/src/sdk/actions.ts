@@ -1,5 +1,6 @@
 import type { ConversationId } from '@earendil-works/pi-durable'
 import { registry, replaceNextSelection, store, uiState } from './client.ts'
+import { events } from './events.ts'
 import { errorMessage } from './format.ts'
 import { writerNow, writingAs } from './writer.ts'
 import {
@@ -136,10 +137,20 @@ export const uncoveredComposer = () =>
     return input instanceof HTMLElement && !input.closest('[inert]')
   })
 
-export function runCommand(id: string, context: UltimateContext = currentContext()) {
+export function runCommand(
+  id: string,
+  context: UltimateContext = currentContext(),
+  via: 'keys' | 'palette' | 'call' = 'call',
+) {
   const command = allCommands().find((candidate) => candidate.id === id)
   if (!command || !applies(command, context)) return
   const who = writerNow()
+  events.emit('ultimate:command', {
+    id,
+    extension: command.extension,
+    surface: context.surface,
+    via,
+  })
   void Promise.resolve()
     .then(() => writingAs(who, () => command.run(context)))
     .catch((error: unknown) =>
