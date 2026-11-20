@@ -29,10 +29,12 @@ import {
   IsolationAction,
   PendingAction,
   ProgressAction,
+  PullRequestAction,
   RepoAction,
   StatsAction,
 } from './refs.ts'
-import type { GithubRepo } from './refs.ts'
+import type { GithubRepo, PullRequest } from './refs.ts'
+import { exec } from '../../lib/exec.ts'
 import { githubRepo, readGithubRepo } from '../../lib/project-identity.ts'
 import { sweepChecks } from './lander.ts'
 import { landingPending, pendingLandingCards, Workspaces, workspaces } from './workspaces.ts'
@@ -45,6 +47,59 @@ function readRepo(key: string) {
   let repo = githubReposOncePerProcess.get(key)
   if (!repo) githubReposOncePerProcess.set(key, (repo = readGithubRepo(key)))
   return repo
+}
+
+const pullRequestsByRepoAndTip = new Map<
+  string,
+  { at: number; pull: Promise<PullRequest | null> }
+>()
+const openOrMissingPullRequestRecheck = 5 * 60_000
+async function pullRequestContainingCommit(name: string, sha: string): Promise<PullRequest | null> {
+  const { stdout } = await exec(
+    'gh',
+    [
+      'pr',
+      'list',
+      '--repo',
+      name,
+      '--state',
+      'all',
+      '--search',
+      sha,
+      '--json',
+      'number,url,state',
+      '--limit',
+      '1',
+    ],
+    { timeout: 15_000 },
+  )
+  const [found] = JSON.parse(stdout) as { number: number; url: string; state: string }[]
+  if (!found) return null
+  const state = found.state.toLowerCase()
+  return {
+    number: found.number,
+    url: found.url,
+    state: state === 'merged' || state === 'closed' ? state : 'open',
+  }
+}
+function pullRequestOf(name: string, sha: string) {
+  const key = `${name} ${sha}`
+  const cached = pullRequestsByRepoAndTip.get(key)
+  if (cached && Date.now() - cached.at < openOrMissingPullRequestRecheck) return cached.pull
+  const entry = { at: Date.now(), pull: Promise.resolve<PullRequest | null>(null) }
+  const mergedOrClosedIsFinal = Infinity
+  entry.pull = pullRequestContainingCommit(name, sha).then(
+    (value) => {
+      if (value && value.state !== 'open') entry.at = mergedOrClosedIsFinal
+      return value
+    },
+    function ghUnavailableTriesAgainNextTime() {
+      pullRequestsByRepoAndTip.delete(key)
+      return null
+    },
+  )
+  pullRequestsByRepoAndTip.set(key, entry)
+  return entry.pull
 }
 
 const finish = (value: unknown) => ({
@@ -75,6 +130,16 @@ export const actions = {
   repo: implementAction(RepoAction, async (_args, { host }) => {
     const key = await githubRepo(host.projectRoot)
     return key ? readRepo(key) : null
+  }),
+  pullRequest: implementAction(PullRequestAction, async (args, { host }) => {
+    const workspace = await workspaces(host).get(workspaceId(args), context)
+    if (!workspace || workspace.state !== 'ready') return null
+    const key = await githubRepo(host.projectRoot)
+    if (!key) return null
+    const tip = await git(workspace.path, 'rev-parse', 'HEAD').catch(() => workspace.base)
+    const freshWorktreeTipBelongsToItsTarget = tip === workspace.base
+    if (freshWorktreeTipBelongsToItsTarget) return null
+    return pullRequestOf(key.slice('github.com/'.length), tip)
   }),
   progress: implementAction(ProgressAction, (args, { host }) => {
     const ids = args && typeof args === 'object' && !Array.isArray(args) ? args.ids : undefined

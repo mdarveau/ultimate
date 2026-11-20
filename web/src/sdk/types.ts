@@ -282,6 +282,27 @@ export const ConversationKind = definePoint<ConversationSummary | undefined, str
   'ultimate.conversationKind',
 )
 /**
+ * The title bar's conversation title, rendered from its text (`workspaces` provides it: `PR #12` links to the project's
+ * GitHub pull request); undefined shows the text as it is.
+ */
+export const ConversationTitle = definePoint<string, ReactNode | undefined>(
+  'ultimate.conversationTitle',
+)
+/**
+ * What the title bar shows after conversation `id`'s title and number, kept whole while the title truncates
+ * (`workspaces` provides it: the pull request of the conversation's branch); undefined shows nothing.
+ */
+export const ConversationTitleAside = definePoint<ConversationId, ReactNode | undefined>(
+  'ultimate.conversationTitleAside',
+)
+/**
+ * A line the title bar shows under conversation `id`'s title, such as what the conversation is about; undefined shows
+ * none, and the bar keeps its single row.
+ */
+export const ConversationTitleBelow = definePoint<ConversationId, ReactNode | undefined>(
+  'ultimate.conversationTitleBelow',
+)
+/**
  * What conversation `conversation`'s composer says while it is empty (`conversations` provides it: "Message Coach…" for
  * a standing agent with `title: Coach`). Every provider is asked and the last that answers wins, so one naming its own
  * conversations leaves another's. Undefined leaves the earlier providers' answer, the core's text while none answers;

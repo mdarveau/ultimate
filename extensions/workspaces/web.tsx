@@ -1,10 +1,20 @@
 import type { ReactNode } from 'react'
 import { GitMergeIcon } from 'lucide-react'
-import { cn, column, defineWebExtension, island, useConversation } from '@/sdk'
+import {
+  cn,
+  column,
+  ConversationTitle,
+  ConversationTitleAside,
+  defineWebExtension,
+  island,
+  provide,
+  useConversation,
+} from '@/sdk'
 import { WorkspaceCall } from './call.solid.tsx'
 import { useWorkspaceIndex } from './data.tsx'
 import { LandingNote } from './landing-note.solid.tsx'
 import { LanderLogEntry, LanderReport } from './log.solid.tsx'
+import { useLinkedTitle, usePullRequestChip } from './pull-requests.tsx'
 
 function LanderComposer({ core, dock }: { core: ReactNode; dock?: boolean }) {
   const id = useConversation((conversation) => conversation.id)
@@ -32,4 +42,8 @@ export default defineWebExtension({
     'ultimate.lander': island(LanderLogEntry),
     'workspaces.lander-report': island(LanderReport),
   },
+  provides: [
+    provide(ConversationTitle, useLinkedTitle),
+    provide(ConversationTitleAside, usePullRequestChip),
+  ],
 })
