@@ -14,6 +14,7 @@ import { WorkspaceCall } from './call.solid.tsx'
 import { useWorkspaceIndex } from './data.tsx'
 import { LandingNote } from './landing-note.solid.tsx'
 import { LanderLogEntry, LanderReport } from './log.solid.tsx'
+import { PullRequestLink } from './pull-request-link.solid.tsx'
 import { useLinkedTitle, usePullRequestChip } from './pull-requests.tsx'
 
 function LanderComposer({ core, dock }: { core: ReactNode; dock?: boolean }) {
@@ -36,6 +37,7 @@ function LanderComposer({ core, dock }: { core: ReactNode; dock?: boolean }) {
 
 export default defineWebExtension({
   composer: LanderComposer,
+  link: PullRequestLink,
   tools: { workspace: island(WorkspaceCall) },
   entries: {
     'lineage.note': island(LandingNote),

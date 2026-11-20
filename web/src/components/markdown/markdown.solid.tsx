@@ -42,7 +42,7 @@ import {
   parse,
 } from './parse.ts'
 import type { Element, ElementContent } from './parse.ts'
-import { mentionHref, parseMention, splitMentions } from '../ai/mentions.ts'
+import { mentionHref, parseMention, parsePullRequest, splitMentions } from '../ai/mentions.ts'
 
 type Rendered = { extension: string; version: number; component: Component<never> }
 
@@ -94,7 +94,7 @@ function Anchor(props: {
 }) {
   const renderers = createMemo(() => linkRenderers(useExtensions()()) as Rendered[])
   const core = () =>
-    parseMention(props.href) ? (
+    parseMention(props.href) || parsePullRequest(props.href) ? (
       props.children
     ) : (
       <ConfirmedLink attributes={props.attributes} href={props.href}>

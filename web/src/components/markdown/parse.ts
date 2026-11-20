@@ -8,7 +8,7 @@ import remarkParse from 'remark-parse'
 import remarkRehype from 'remark-rehype'
 import remend from 'remend'
 import { unified } from 'unified'
-import { remarkMentions } from '../ai/mentions.ts'
+import { remarkMentions, remarkPullRequests } from '../ai/mentions.ts'
 
 export const incompleteLink = 'streamdown:incomplete-link'
 
@@ -60,6 +60,7 @@ declare module 'mdast' {
 
 const markdownTree = unified().use(remarkParse).use(remarkGfm).use(remarkClosedFences)
 const toHast = unified()
+  .use(remarkPullRequests)
   .use(remarkMentions)
   .use(remarkRehype, { allowDangerousHtml: true })
   .use(rehypeRaw)
