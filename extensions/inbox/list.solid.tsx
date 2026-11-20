@@ -131,7 +131,7 @@ export function List(props: { rows: readonly Row[]; phone: boolean }) {
         <span class="section-label">
           Waiting on you · <span class={amber}>{props.rows.length}</span>
         </span>
-        <span class="section-label">oldest first</span>
+        <span class="section-label">newest first</span>
       </div>
       <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4" data-inbox-list>
         <For each={props.rows} keyed={(row) => row.key}>

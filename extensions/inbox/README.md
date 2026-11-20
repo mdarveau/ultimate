@@ -1,6 +1,6 @@
 # Inbox
 
-Everything that waits on the user, oldest first, answered in place: the `inbox` surface, first tab after Agent. Its
+Everything that waits on the user, newest first, answered in place: the `inbox` surface, first tab after Agent. Its
 items are the open questions in the live Messages log merged with the items other extensions provide (`items.ts`);
 a question leaves the moment it is answered or dismissed, wherever
 that happened, a provided item when its provider stops listing it. Browser only: no `server.ts`, no documents, no
@@ -38,7 +38,7 @@ handler. They receive plain data, not provided panes.
 The durable UI key `ext.inbox.selected` holds `{ key, at, open }`. The list and the reading pane show that key if
 present. If it leaves, they show the next one in the list's order (by age, then key), or the last entry if none is
 that new, and the selection moves to that entry, so a newer arrival never takes its place.
-With no selection they show the oldest entry. Desktop ignores `open`; the phone's back arrow clears `open` without
+With no selection they show the newest entry. Desktop ignores `open`; the phone's back arrow clears `open` without
 forgetting the selection.
 
 `?inbox=<key>` on load opens the surface at that entry and removes the parameter from the address. The
@@ -48,7 +48,7 @@ its key with `at: 0`, so the entry shows when it arrives and the selection takes
 
 ## Elsewhere
 
-- **Sidebar**: a row under @ultimate's (`sidebar.under-ultimate`), amber `Inbox · N · oldest 2h` while items wait,
+- **Sidebar**: a row under @ultimate's (`sidebar.under-ultimate`), amber `Inbox · N · oldest 2h` (how long the oldest has waited) while items wait,
   a quiet `Inbox` at zero; a click opens the surface. @ultimate's own row then says only `waits on you`.
 - **To-dos**: the panel's "For you" keeps one `Inbox · N` row, provided items counted, that opens it.
 - ⌘K **Open Inbox**.

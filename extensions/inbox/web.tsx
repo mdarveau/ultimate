@@ -88,7 +88,7 @@ function useInboxSidebar() {
   return (
     <Waiting>
       {(entries) => (
-        <SidebarIsland active={active} count={entries.length} oldest={entries[0]?.at} />
+        <SidebarIsland active={active} count={entries.length} oldest={entries.at(-1)?.at} />
       )}
     </Waiting>
   )
@@ -113,7 +113,7 @@ export default defineWebExtension({
       id: SURFACE,
       title: 'Inbox',
       icon: InboxIcon,
-      description: 'Everything that waits on you, oldest first, answered in place',
+      description: 'Everything that waits on you, newest first, answered in place',
       order: 10,
       component: Inbox,
       badge: WaitingBadge,

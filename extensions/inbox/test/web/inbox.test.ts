@@ -34,29 +34,30 @@ const item = (key: string, at: number): InboxItem => ({
   pane: null,
 })
 
-it('lists the open questions to the user and the provided items, oldest first', () => {
-  expect(inboxItems(log).map((entry) => entry.key)).toEqual(['message:1', 'message:3', 'message:7'])
+it('lists the open questions to the user and the provided items, newest first', () => {
+  expect(inboxItems(log).map((entry) => entry.key)).toEqual(['message:7', 'message:3', 'message:1'])
   const merged = inboxItems(log, [[item('shell:a', 350)], [item('mail:b', 50)]])
   expect(merged.map((entry) => entry.key)).toEqual([
-    'mail:b',
-    'message:1',
-    'message:3',
-    'shell:a',
     'message:7',
+    'shell:a',
+    'message:3',
+    'message:1',
+    'mail:b',
   ])
 })
 
-it('moves on to the next oldest when the shown item is answered', () => {
+it('moves on to the next older one when the shown item is answered', () => {
   const before = inboxItems(log)
   const selected = { key: 'message:3', at: 300, open: true }
-  expect(shown(before, null)?.key).toBe('message:1')
+  expect(shown(before, null)?.key).toBe('message:7')
   expect(shown(before, selected)?.key).toBe('message:3')
   const after = inboxItems(
     log.map((m) => (m.id === 3 ? { ...m, state: 'answered' as const } : m)),
     [[item('shell:old', 200)]],
   )
-  expect(shown(after, selected)?.key).toBe('message:7')
-  expect(shown(after.slice(0, -1), { key: 'message:7', at: 700, open: false })?.key).toBe(
+  expect(shown(after, selected)?.key).toBe('shell:old')
+  // The oldest answered: the one before it shows.
+  expect(shown(after.slice(0, -1), { key: 'message:1', at: 100, open: false })?.key).toBe(
     'shell:old',
   )
   expect(shown([], selected)).toBeUndefined()
@@ -68,27 +69,27 @@ const at = (key: string, time: number): Anchor => ({ key, at: time })
 
 it('keeps the item that took the shown one’s place when a newer one arrives, mounted or not', () => {
   const [a, b, d] = [at('a', 10), at('b', 20), at('d', 40)]
-  let selected = step([a, b], { key: 'c', at: 30, open: true })
+  let selected = step([b, a], { key: 'c', at: 30, open: true })
   expect(selected).toEqual({ key: 'b', at: 20, open: true })
-  selected = step([a, b, d], selected)
-  expect(shown([a, b, d], selected)?.key).toBe('b')
+  selected = step([d, b, a], selected)
+  expect(shown([d, b, a], selected)?.key).toBe('b')
 })
 
 it('waits for a linked key, then moves on from it by its real age', () => {
   const [a, b, c] = [at('a', 10), at('b', 20), at('c', 30)]
-  let selected = step([a, c], { key: 'b', at: UNLOADED, open: true })
+  let selected = step([c, a], { key: 'b', at: UNLOADED, open: true })
   expect(selected).toEqual({ key: 'b', at: UNLOADED, open: true })
-  selected = step([a, b, c], selected)
+  selected = step([c, b, a], selected)
   expect(selected).toEqual({ key: 'b', at: 20, open: true })
-  selected = step([a, c], selected)
-  expect(selected).toEqual({ key: 'c', at: 30, open: true })
+  selected = step([c, a], selected)
+  expect(selected).toEqual({ key: 'a', at: 10, open: true })
 })
 
-it('moves forward past items of the same age', () => {
+it('moves on past items of the same age', () => {
   const entries = inboxItems([], [[item('x:b', 10), item('x:a', 10), item('x:c', 20)]])
-  expect(entries.map((entry) => entry.key)).toEqual(['x:a', 'x:b', 'x:c'])
+  expect(entries.map((entry) => entry.key)).toEqual(['x:c', 'x:b', 'x:a'])
   const left = entries.filter((entry) => entry.key !== 'x:b')
-  expect(shown(left, { key: 'x:b', at: 10, open: false })?.key).toBe('x:c')
+  expect(shown(left, { key: 'x:b', at: 10, open: false })?.key).toBe('x:a')
 })
 
 it('reads a link as a key, a plain number as a message id', () => {

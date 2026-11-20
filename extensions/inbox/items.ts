@@ -47,7 +47,7 @@ export const inboxItems = (
     ...provided.flat().map((item) => ({ key: item.key, at: item.at, item })),
   ].toSorted(byAge)
 
-const byAge = (a: Anchor, b: Anchor) => a.at - b.at || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+const byAge = (a: Anchor, b: Anchor) => b.at - a.at || (a.key < b.key ? 1 : a.key > b.key ? -1 : 0)
 
 export function shown<T extends Anchor>(entries: readonly T[], selected: Selection): T | undefined {
   if (!selected) return entries[0]
