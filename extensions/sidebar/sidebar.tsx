@@ -235,7 +235,6 @@ function Tree({
   )
   const [query, setQuery] = useState('')
   const matches = conversationFilter(query)
-  /** Whether a row shows under the filter: it matches, or a branch nested under it in the same group does. */
   const visible = (conversation: ConversationSummary, concluded: boolean): boolean =>
     !matches ||
     matches(conversation, overview[conversation.id]?.feature) ||
@@ -245,7 +244,6 @@ function Tree({
         !openBranches.includes(branch) &&
         visible(branch, concluded),
     )
-  // The rest, with branches nested under their source when it is there too.
   const earlier = rest.filter(
     (conversation) =>
       !rest.some((source) => source.id === conversation.branchOf?.conversationId) &&
@@ -670,7 +668,6 @@ function Tree({
             )}
           </section>
         )}
-      {/* While filtering, matches follow the field instead of sitting at the bottom. */}
       <div className={cn('pt-3', !matches && 'mt-auto')}>
         {earlier.length > 0 && (
           <Collapsible

@@ -18,7 +18,6 @@ export default defineWebExtension({
       keys: '/',
       run: (context) => {
         if (document.querySelector('[data-sidebar-filter]')) return focusFilter()
-        // A closed sidebar mounts no field: open it, then focus once it rendered.
         context.toggleSidebar()
         requestAnimationFrame(() => requestAnimationFrame(focusFilter))
       },

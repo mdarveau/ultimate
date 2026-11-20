@@ -1,8 +1,3 @@
-/**
- * The sidebar's conversation filter: a row matches when every word of the query appears in its title, `#id` or
- * feature tag, ignoring case and accents (`paie` finds `Paie`, `ete` finds `Été`). A title's `PR #2287` matches `#2287`
- * too, as the header's pull request chip comes from it. Browser-safe.
- */
 const fold = (text: string) => text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
 
 export function conversationFilter(query: string) {

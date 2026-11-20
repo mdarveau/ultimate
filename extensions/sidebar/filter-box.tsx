@@ -1,14 +1,9 @@
 import { SearchIcon, XIcon } from 'lucide-react'
 import { Kbd } from '@/components/ui/kbd'
 
-/** The `/` command's target: the sidebar's filter field. */
 export const focusFilter = () =>
   document.querySelector<HTMLInputElement>('[data-sidebar-filter]')?.focus()
 
-/**
- * The quiet field above In flight that filters every group of the tree (see `filter.ts`). `/` focuses it, Escape
- * clears it, Enter opens the first match.
- */
 export function FilterBox({
   query,
   empty,
@@ -16,7 +11,6 @@ export function FilterBox({
   onOpenFirst,
 }: {
   query: string
-  /** Nothing matches the query. */
   empty: boolean
   onChange: (query: string) => void
   onOpenFirst: () => void
